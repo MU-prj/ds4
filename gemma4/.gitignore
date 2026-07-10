@@ -1,4 +1,7 @@
 g4_test
 g4_toy_test
+g4_tok_test
+g4_session_test
+g4-quantize
 *.o
 tests/vectors/tok_table.bin
