@@ -246,10 +246,12 @@ Differenza strutturale importante rispetto a DeepSeek: in Gemma 4 gate e up
 sono **un solo tensore fuso** con asse `k∈{0,1}`. Per applicare bit-width
 diversi a gate/up vs down (schema ds4) non serve separarli: gate+up stanno
 già nello stesso tensore e riceverebbero comunque lo stesso formato; il down
-è un tensore separato. La riga interna dei tensori esperti è lunga 2816 o
-704: entrambe multiple di 256 (`QK_K`, `quants.c:34`), quindi compatibili con
-i blocchi IQ2_XXS/Q2_K a prescindere dall'orientamento scelto in fase di
-conversione. **[HF-PENDING]**: i nomi/shape esatti nei safetensors HF (che
+è un tensore separato. Attenzione ai vincoli di blocco dei formati k-quant:
+la contrazione di gate/up avviene su 2816, che è multiplo di 256 (`QK_K`,
+`quants.c:34`), ma quella del down avviene su 704, che **non** lo è
+(704 = 2×256 + 192): per quantizzare il down con Q2_K servono padding a 768
+o un layout trasposto — la scelta è documentata nella Fase 2 (doc 02).
+**[HF-PENDING]**: i nomi/shape esatti nei safetensors HF (che
 potrebbero essere già trasposti o splittati per esperto) e la loro precisione
 nativa (bf16 attesa).
 
