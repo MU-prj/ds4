@@ -285,6 +285,10 @@ struct g4_gguf_writer {
     uint64_t n_kv;
     g4_gguf_wtensor *tensor;
     uint64_t n_tensor, cap_tensor;
+    /* streaming state */
+    FILE *fp;
+    uint64_t cur;       /* tensor being written */
+    uint64_t cur_left;  /* bytes still expected for it */
 };
 
 g4_gguf_writer *g4_gguf_writer_new(void) {
@@ -433,4 +437,85 @@ werr:
     fclose(fp);
     g4_gguf_seterr(err, errlen, "write failed");
     return -1;
+}
+
+/* ------------------------------------------------------------------ */
+/* Streaming writer                                                    */
+/* ------------------------------------------------------------------ */
+
+int g4_gguf_writer_tensor_info(g4_gguf_writer *w, const char *name,
+                               g4q_type type, uint32_t n_dims,
+                               const uint64_t *dims) {
+    uint64_t nbytes = g4_tensor_nbytes(type, n_dims, dims);
+    if (nbytes == 0) return -1;
+    return g4_gguf_writer_tensor(w, name, type, n_dims, dims, NULL, nbytes);
+}
+
+int g4_gguf_writer_begin(g4_gguf_writer *w, const char *path,
+                         char *err, size_t errlen) {
+    uint64_t off = 0;
+    for (uint64_t i = 0; i < w->n_tensor; i++) {
+        w->tensor[i].offset = off;
+        off = g4_align_up(off + w->tensor[i].nbytes, G4_GGUF_ALIGN);
+    }
+    FILE *fp = fopen(path, "wb");
+    if (!fp) { g4_gguf_seterr(err, errlen, "cannot create file"); return -1; }
+    uint32_t magic = G4_GGUF_MAGIC, version = G4_GGUF_VERSION;
+    if (fwrite(&magic, 4, 1, fp) != 1 || fwrite(&version, 4, 1, fp) != 1 ||
+        fwrite(&w->n_tensor, 8, 1, fp) != 1 || fwrite(&w->n_kv, 8, 1, fp) != 1 ||
+        (w->kvbuf.len && fwrite(w->kvbuf.p, 1, w->kvbuf.len, fp) != w->kvbuf.len))
+        goto werr;
+    for (uint64_t i = 0; i < w->n_tensor; i++) {
+        const g4_gguf_wtensor *t = &w->tensor[i];
+        uint64_t name_len = strlen(t->name);
+        if (fwrite(&name_len, 8, 1, fp) != 1 ||
+            fwrite(t->name, 1, (size_t)name_len, fp) != name_len ||
+            fwrite(&t->n_dims, 4, 1, fp) != 1 ||
+            fwrite(t->dims, 8, t->n_dims, fp) != t->n_dims ||
+            fwrite(&t->type, 4, 1, fp) != 1 ||
+            fwrite(&t->offset, 8, 1, fp) != 1)
+            goto werr;
+    }
+    long pos = ftell(fp);
+    if (pos < 0) goto werr;
+    uint64_t pad = g4_align_up((uint64_t)pos, G4_GGUF_ALIGN) - (uint64_t)pos;
+    static const uint8_t zeros[G4_GGUF_ALIGN] = {0};
+    if (pad && fwrite(zeros, 1, (size_t)pad, fp) != pad) goto werr;
+    w->fp = fp;
+    w->cur = 0;
+    w->cur_left = w->n_tensor ? w->tensor[0].nbytes : 0;
+    return 0;
+werr:
+    fclose(fp);
+    g4_gguf_seterr(err, errlen, "write failed");
+    return -1;
+}
+
+int g4_gguf_writer_put(g4_gguf_writer *w, const void *data, uint64_t nbytes) {
+    static const uint8_t zeros[G4_GGUF_ALIGN] = {0};
+    if (!w->fp || w->cur >= w->n_tensor || nbytes > w->cur_left) return -1;
+    if (fwrite(data, 1, (size_t)nbytes, w->fp) != nbytes) return -1;
+    w->cur_left -= nbytes;
+    if (w->cur_left == 0) {
+        uint64_t end = w->tensor[w->cur].offset + w->tensor[w->cur].nbytes;
+        uint64_t pad = g4_align_up(end, G4_GGUF_ALIGN) - end;
+        if (pad && fwrite(zeros, 1, (size_t)pad, w->fp) != pad) return -1;
+        w->cur++;
+        w->cur_left = w->cur < w->n_tensor ? w->tensor[w->cur].nbytes : 0;
+    }
+    return 0;
+}
+
+int g4_gguf_writer_end(g4_gguf_writer *w, char *err, size_t errlen) {
+    if (!w->fp) { g4_gguf_seterr(err, errlen, "not begun"); return -1; }
+    if (w->cur != w->n_tensor) {
+        g4_gguf_seterr(err, errlen, "missing tensor data");
+        fclose(w->fp);
+        w->fp = NULL;
+        return -1;
+    }
+    int rc = fclose(w->fp);
+    w->fp = NULL;
+    if (rc) { g4_gguf_seterr(err, errlen, "close failed"); return -1; }
+    return 0;
 }

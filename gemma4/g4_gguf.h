@@ -92,4 +92,18 @@ int g4_gguf_writer_tensor(g4_gguf_writer *w, const char *name, g4q_type type,
 int g4_gguf_writer_finish(g4_gguf_writer *w, const char *path,
                           char *err, size_t errlen);
 
+/* Streaming mode, for files larger than RAM: declare every tensor with
+ * g4_gguf_writer_tensor_info() (same order as the data will come), then
+ * g4_gguf_writer_begin() writes header+metadata+infos, and the data is
+ * appended per tensor with g4_gguf_writer_put() (exactly nbytes per tensor,
+ * in declaration order; padding is handled internally).  Finish with
+ * g4_gguf_writer_end().  Do not mix with g4_gguf_writer_finish(). */
+int g4_gguf_writer_tensor_info(g4_gguf_writer *w, const char *name,
+                               g4q_type type, uint32_t n_dims,
+                               const uint64_t *dims);
+int g4_gguf_writer_begin(g4_gguf_writer *w, const char *path,
+                         char *err, size_t errlen);
+int g4_gguf_writer_put(g4_gguf_writer *w, const void *data, uint64_t nbytes);
+int g4_gguf_writer_end(g4_gguf_writer *w, char *err, size_t errlen);
+
 #endif

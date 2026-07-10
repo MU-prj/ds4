@@ -52,6 +52,8 @@ typedef struct {
     /* Combined. */
     float *post_ffn_norm; /* [D] post_ffw_norm */
     float *skip_scale;    /* [1] */
+    uint32_t down_row;    /* row length of down_exps (>= expert_dim: k-quant
+                             block padding, gemma4-port/02 §2) */
     bool is_global;
 } g4_layer;
 
@@ -214,8 +216,17 @@ g4_model *g4_model_load(const char *path, char *err, size_t errlen) {
              (uint64_t)m->n_experts * m->expert_dim * D);
         LOAD(up_exps, "ffn_up_exps.weight",
              (uint64_t)m->n_experts * m->expert_dim * D);
+        {
+            snprintf(name, sizeof(name), "blk.%u.ffn_down_exps.weight", i);
+            const g4_gguf_tensor *td = g4_gguf_tensor_by_name(&g, name);
+            if (!td || td->dims[0] < m->expert_dim) {
+                seterr(err, errlen, "bad down_exps tensor %s", name);
+                goto fail;
+            }
+            l->down_row = (uint32_t)td->dims[0];
+        }
         LOAD(down_exps, "ffn_down_exps.weight",
-             (uint64_t)m->n_experts * D * m->expert_dim);
+             (uint64_t)m->n_experts * D * l->down_row);
         LOAD(ffn_norm_shexp, "ffn_norm_shexp.weight", D);
         LOAD(post_ffn_norm_shexp, "post_ffn_norm_shexp.weight", D);
         LOAD(gate_shexp, "ffn_gate_shexp.weight", (uint64_t)m->dense_ffn * D);
@@ -516,7 +527,9 @@ int g4_session_eval(g4_session *s, int32_t token) {
             matvec(l->up_exps + (size_t)e * Hexp * D, xn, s->up, Hexp, D);
             for (uint32_t hh = 0; hh < Hexp; hh++)
                 s->gate[hh] = gelu_tanh(s->gate[hh]) * s->up[hh];
-            matvec(l->down_exps + (size_t)e * D * Hexp, s->gate, s->ffn, D, Hexp);
+            const float *wd = l->down_exps + (size_t)e * D * l->down_row;
+            for (uint32_t d = 0; d < D; d++)
+                s->ffn[d] = dot(wd + (size_t)d * l->down_row, s->gate, Hexp);
             for (uint32_t d = 0; d < D; d++)
                 s->moe_out[d] += w * pes * s->ffn[d];
         }

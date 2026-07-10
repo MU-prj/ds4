@@ -10,7 +10,7 @@ I documenti di progetto sono in [`../gemma4-port/`](../gemma4-port/):
 3. `03-disk-kv-cache.md` — formato G4KV/G4SP e politiche di frontiera
 4. `04-piano-implementazione.md` — milestone M0-M7
 
-## Stato: M1 + tokenizer + sessioni/G4SP validati
+## Stato: M2 pre-validata (convertitore) + M1 + tokenizer + sessioni/G4SP
 
 | Modulo | Contenuto | Stato |
 |---|---|---|
@@ -26,6 +26,9 @@ I documenti di progetto sono in [`../gemma4-port/`](../gemma4-port/):
 | API di sessione (`g4.h`) | decode incrementale con KV persistente: ring di `sliding_window` righe sui layer locali, storia piena sui globali | fatto |
 | payload G4SP (`g4_session_save/load_payload`) | serializzazione dello stato per il disk KV (doc 03 §5), dtype f32 nel path di riferimento | fatto |
 | `tests/g4_session_test.c` | incrementale == batch; save a metà (oltre il wrap del ring) → resume in sessione nuova → continuazione **bit-esatta**; reject di shape/ctx sbagliati | verde |
+| `tools/g4-quantize.c` | convertitore safetensors→GGUF senza template: config da config.json, shape dagli header degli shard con **verifica di orientamento** (rifiuta layout trasposti), split del fuso gate_up, padding del down ai blocchi k-quant, profili `f32`/`q8`/`q4`, scrittura streaming, `--dry-run`/`--compare-tensor` | fatto (v1: no imatrix, single-thread) |
+| `scripts/gen_synthetic_hf.py` + `make test-converter` | checkpoint HF **sintetico** ricostruito dai pesi toy (stessi nomi/layout di google/gemma-4-26B-A4B-it) → convertito → il motore rifà i logits JAX **esatti** (5e-6) | verde |
+| `scripts/gen_logit_vectors.py` | vettori top-k logprob dal modello vero via transformers (gate M2) | scritto, da eseguire sulla macchina con i pesi |
 
 ```sh
 make test

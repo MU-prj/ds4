@@ -11,12 +11,17 @@
 #include <string.h>
 
 int main(int argc, char **argv) {
+    /* argv: [model.gguf [ref.gguf [max_abs_diff]]] — the ref defaults to the
+     * model file itself (toy.gguf carries its own ref.* tensors); a converted
+     * GGUF is validated against toy.gguf's references. */
     const char *path = argc > 1 ? argv[1] : "tests/vectors/toy.gguf";
+    const char *ref_path = argc > 2 ? argv[2] : path;
+    double max_allowed = argc > 3 ? atof(argv[3]) : 5e-3;
     char err[256] = "";
 
     g4_gguf g;
-    if (g4_gguf_open(&g, path, err, sizeof(err))) {
-        fprintf(stderr, "cannot open %s: %s\n", path, err);
+    if (g4_gguf_open(&g, ref_path, err, sizeof(err))) {
+        fprintf(stderr, "cannot open %s: %s\n", ref_path, err);
         return 1;
     }
     const g4_gguf_tensor *ttok = g4_gguf_tensor_by_name(&g, "ref.tokens");
@@ -73,7 +78,8 @@ int main(int argc, char **argv) {
            max_abs, max_pos, mean_abs, argmax_match, n_tokens);
 
     int failed = 0;
-    if (max_abs > 5e-3 || mean_abs > 5e-4 || argmax_match != n_tokens) {
+    if (max_abs > max_allowed || mean_abs > max_allowed / 10.0 ||
+        argmax_match != n_tokens) {
         printf("FAILED: logits diverge from the JAX reference\n");
         failed = 1;
     } else {
