@@ -1,3 +1,4 @@
 g4_test
 g4_toy_test
 *.o
+tests/vectors/tok_table.bin
