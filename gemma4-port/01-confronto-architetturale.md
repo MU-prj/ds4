@@ -13,10 +13,13 @@ di prima classe su SSD) sull'architettura di Gemma 4 26B-A4B.
   `gemma/gm/nn/gemma4/` (`_gemma4.py`, `_config.py`, `_modules.py`, `_moe.py`,
   `_transformer.py`, `_layers.py`) e `gemma/gm/text/_tokenizer.py`.
 
-**Stato:** completo per tutto ciò che è derivabile dai due repository locali.
-I punti che richiedono i metadati Hugging Face di `google/gemma-4-26B-A4B-it`
-(`config.json`, `tokenizer_config.json`, `model.safetensors.index.json`) sono
-marcati **[HF-PENDING]** e riepilogati in §9.
+- Metadati Hugging Face di `google/gemma-4-26B-A4B-it` in
+  `gemma4-port/hf-metadata/` (`config.json`, `tokenizer.json`,
+  `tokenizer_config.json`, `model.safetensors.index.json`).
+
+**Stato:** completo. I punti inizialmente marcati **[HF-PENDING]** sono stati
+chiusi con i metadati HF (vedi §9); l'unico residuo minore è il file
+`chat_template.jinja` (§9.3).
 
 ---
 
@@ -37,11 +40,11 @@ marcati **[HF-PENDING]** e riepilogati in §9.
 | FFN dim esperto | 2048 (`ds4.c:194`) | 704 (`_gemma4.py:283`) |
 | Attivazione FFN | SwiGLU con clamp (`ds4.c:205`, `swiglu_clamp_exp`) | **GeGLU**: `gelu(x1) * x2` (`_moe.py:346`, `_modules.py:453`) |
 | Layer MoE | tutti tranne i primi `n_hash_layer=3` densi (`ds4.c:195`) | **tutti e 30** (`_transformer.py:189`, `enable_moe` passato a ogni Block) |
-| Context max | 1M token (`MODEL_CARD.md:16`) | **[HF-PENDING]** non presente nel codice JAX (`cache_length` è un parametro runtime, `_config.py:157-193`) |
+| Context max | 1M token (`MODEL_CARD.md:16`) | **262144 (256k)** (`hf-metadata/config.json:68`, `max_position_embeddings`) |
 | Softcap logits finali | no | tanh cap a 30.0 (`_gemma4.py:265`, `_transformer.py:334-336`) |
 | Embeddings | separate da output head (`output.*` in `deepseek4-quantize.c:1009`) | **tied**: `decode = x @ input_embedding_table.T` (`_modules.py:127-137`) |
 | Extra strutturali | Manifold-Constrained Hyper-Connections, n_hc=4 (`ds4.c:200`, `MODEL_CARD.md:67`) | `skip_scale` scalare per blocco (`_modules.py:499,662`); norm post-attn e post-ffw (`_gemma4.py:267-268`) |
-| Licenza | MIT (`MODEL_CARD.md:231`) | Apache 2.0 (header dei sorgenti; licenza pesi **[HF-PENDING]**) |
+| Licenza | MIT (`MODEL_CARD.md:231`) | Apache 2.0 (header dei sorgenti JAX; per i pesi, dichiarata Apache 2.0 nel brief di progetto — il file LICENSE del repo HF non è tra i metadati scaricati) |
 
 Nota dimensioni: 25.2B × 2 byte (bf16) ≈ 50.4 GB, coerente con i ~52 GB dei
 pesi HF citati nel brief del progetto.
@@ -192,9 +195,12 @@ Algoritmo di routing (`_moe.py:301-310, 381-407`):
 
 Nota implementativa: `jax.lax.approx_max_k` è un top-k **approssimato** (TPU).
 In un motore C il top-8 esatto è la scelta naturale; l'eventuale divergenza
-dai logits ufficiali va verificata in fase di validazione. **[HF-PENDING]**
-anche la conferma che il checkpoint HF usi esattamente questo grafo (config
-`num_experts_per_tok`, ecc.).
+dai logits ufficiali va verificata in fase di validazione. Il config HF
+conferma gli iperparametri: `num_experts=128`, `top_k_experts=8`,
+`enable_moe_block=true`, `moe_intermediate_size=704`
+(`hf-metadata/config.json:70-92`); attivazione `gelu_pytorch_tanh`
+(approssimazione tanh della GELU, `config.json:31`) e
+`use_double_wide_mlp=false` (`config.json:95`).
 
 ### 4.3 Peso relativo dei rami
 
@@ -223,7 +229,7 @@ Shared expert e router restano fuori: `ffn_{gate,up,down}_shexp.weight`,
 `ffn_gate_inp.weight`, `exp_probs_b.bias` (`deepseek4-quantize.c:949-954`,
 `is_shared_expert()` a `deepseek4-quantize.c:1003-1005`).
 
-### 5.2 Gemma 4 (parametri Flax; nomi safetensors HF [HF-PENDING])
+### 5.2 Gemma 4 (parametri Flax e nomi safetensors HF)
 
 Per ogni `layer_i` (i = 0..29), nel param-tree Flax (`_moe.py:273-299`,
 `_modules.py:496-591`):
@@ -251,9 +257,33 @@ la contrazione di gate/up avviene su 2816, che è multiplo di 256 (`QK_K`,
 `quants.c:34`), ma quella del down avviene su 704, che **non** lo è
 (704 = 2×256 + 192): per quantizzare il down con Q2_K servono padding a 768
 o un layout trasposto — la scelta è documentata nella Fase 2 (doc 02).
-**[HF-PENDING]**: i nomi/shape esatti nei safetensors HF (che
-potrebbero essere già trasposti o splittati per esperto) e la loro precisione
-nativa (bf16 attesa).
+
+Nomi confermati nei safetensors HF (`hf-metadata/model.safetensors.index.json`,
+1013 tensori, `total_size` = 51'611'872'412 byte = 48.07 GiB, dtype bf16 da
+`config.json:9`), per ogni layer `i` sotto il prefisso
+`model.language_model.layers.i.`:
+
+| Tensore HF | Corrispondenza Flax | Note |
+|---|---|---|
+| `experts.gate_up_proj` | `mlp/gating_einsum/w` | **fuso** gate+up, ×30 layer, senza suffisso `.weight` |
+| `experts.down_proj` | `mlp/linear/w` | ×30 layer |
+| `router.proj.weight` | `mlp/router_logits/w` | ×30 |
+| `router.scale` | `mlp/router_scale` | ×30 |
+| `router.per_expert_scale` | `mlp/per_expert_scale` | ×30 |
+| `mlp.gate_proj.weight` / `mlp.up_proj.weight` / `mlp.down_proj.weight` | `mlp2/*` | ramo denso: in HF gate e up sono **separati** |
+| `self_attn.q_proj.weight`, `self_attn.k_proj.weight`, `self_attn.o_proj.weight` | `attn/*_einsum` | ×30 |
+| `self_attn.v_proj.weight` | `attn/kv_einsum` (parte V) | **solo ×25**: sui 5 layer globali non esiste, conferma K=V |
+| `self_attn.q_norm.weight`, `self_attn.k_norm.weight` | `query_norm`/`key_norm` | nessun parametro per `value_norm` (RMSNorm senza scale) |
+| `input_layernorm`, `post_attention_layernorm`, `pre_feedforward_layernorm`, `pre_feedforward_layernorm_2`, `post_feedforward_layernorm_1`, `post_feedforward_layernorm_2`, `post_feedforward_layernorm` | le 7 RMSNorm del blocco | mapping preciso MoE/denso da verificare a livello numerico in implementazione |
+| `layer_scalar` | `skip_scale` | ×30 |
+
+Fuori dai layer: `model.language_model.embed_tokens.weight` (tied, nessun
+`lm_head` separato, coerente con `tie_word_embeddings=true`,
+`config.json:91,99`) e `model.language_model.norm.weight` (final norm). I
+tensori `model.vision_tower.*` e `model.embed_vision.*` (~1.1 GiB) riguardano
+l'encoder visivo. L'index non riporta le shape: l'orientamento esatto
+(convenzione torch `[out, in]` per i `.weight`) va confermato leggendo gli
+header dei singoli shard safetensors in fase di conversione.
 
 ### 5.3 Verifica di coerenza dei conteggi
 
@@ -311,11 +341,11 @@ fallback sintetico per la prima iterazione).
 
 | Aspetto | DeepSeek V4 Flash | Gemma 4 |
 |---|---|---|
-| Modello tokenizer | BPE proprietario, vocab 129280 (`ds4.c:182`) | **SentencePiece** `tokenizer_gemma4.model`, VERSION=4, vocab 262144 (`_tokenizer.py:477-487`, `_gemma4.py:259`) |
-| Sorgente template | renderer Python ufficiale `encoding_dsv4.py`, niente Jinja (`MODEL_CARD.md:139-146`) | formato `dialog.Format.GEMMA4` del pacchetto esterno `dialog` (`_tokenizer.py:486`); chat template Jinja HF **[HF-PENDING]** |
-| Token di turno | `<｜User｜>`, `<｜Assistant｜>`, BOS/EOS dedicati (`MODEL_CARD.md:147-158`) | `<|turn>` = 105, `<turn|>` = 106, BOS=2, EOS=1, PAD=0 (`_tokenizer.py:138-166`) |
-| Thinking | `<think>`/`</think>` + modalità Max (`MODEL_CARD.md:90-99`) | non presente nei sorgenti JAX **[HF-PENDING]** (verificare nel chat template) |
-| Tool-calling | **DSML** testuale, con canonicalizzazione + exact-replay map nel server (`README.md:771-801`) | tag `dialog.Tags.TOOL_CALL` / `TOOL_RESPONSE` con payload **JSON** (`chunk.data.full_json`), token dedicati es. `BEGIN_OF_TOOL_RESPONSE`=50 (`gm/tools/_manager.py:58-84`, `_tokenizer.py:161-166`) |
+| Modello tokenizer | BPE proprietario, vocab 129280 (`ds4.c:182`) | **SentencePiece** `tokenizer_gemma4.model`, VERSION=4, vocab 262144 (`_tokenizer.py:477-487`, `_gemma4.py:259`); su HF classe `GemmaTokenizer` backend `tokenizers` con `tokenizer.json` da ~32 MB (`hf-metadata/tokenizer_config.json:3,72`) |
+| Sorgente template | renderer Python ufficiale `encoding_dsv4.py`, niente Jinja (`MODEL_CARD.md:139-146`) | formato `dialog.Format.GEMMA4` (`_tokenizer.py:486`); lato HF il formato di output è codificato nel `response_schema` regex di `tokenizer_config.json:25-65`; il file `chat_template.jinja` (input) è separato e non ancora scaricato (§9.3) |
+| Token di turno | `<｜User｜>`, `<｜Assistant｜>`, BOS/EOS dedicati (`MODEL_CARD.md:147-158`) | `<|turn>` = 105, `<turn|>` = 106, BOS=2, EOS=1, PAD=0 (`_tokenizer.py:138-166`); EOS di generazione doppio: `[1, 106]` (`config.json:13-16`) |
+| Thinking | `<think>`/`</think>` + modalità Max (`MODEL_CARD.md:90-99`) | canale dedicato: `<|channel>thought\n ... <channel|>` prima del contenuto (regex in `tokenizer_config.json:64`); esiste anche un `think_token` `<|think|>` (`tokenizer_config.json:71`) |
+| Tool-calling | **DSML** testuale, con canonicalizzazione + exact-replay map nel server (`README.md:771-801`) | blocchi `<|tool_call>call:NOME{argomenti JSON}<tool_call|>` (regex `tokenizer_config.json:38-48`, parser dedicato `x-parser: gemma4-tool-call`), risposte in `<|tool_response>...<tool_response|>`, definizioni in `<|tool>...<tool|>`, token di escape `<|\"|>` (`tokenizer_config.json:12-15,66-70`) |
 
 Implicazione: un equivalente del parser DSML **serve**, ma è più semplice.
 Il problema che ds4 risolve con l'exact-replay DSML (il client rimanda la
@@ -323,8 +353,10 @@ history in JSON normalizzato e il re-render deve combaciare byte-per-byte col
 KV checkpoint, `README.md:771-792`) esiste identico anche con Gemma 4 — è una
 proprietà delle API stateless, non del formato — quindi la parte di design
 "tool id → blocco sampled esatto" va ripresa; cambia solo la sintassi da
-parsare (tag + JSON invece di DSML). I byte esatti dei tag e lo schema del
-system prompt tools vanno presi dal chat template HF **[HF-PENDING]**.
+parsare: `<|tool_call>call:NOME{...}<tool_call|>` con argomenti JSON e token
+di escape `<|"|>`, invece di DSML. Il rendering lato input (system prompt,
+definizioni tool in `<|tool>...<tool|>`) va confermato da
+`chat_template.jinja` (§9.3).
 
 Bug noto citato nei sorgenti: i modelli nano (E2B/E4B) a volte emettono
 `<eos>` invece di `<|tool_response>` (`gm/tools/_manager.py:64-67`) — da
@@ -366,22 +398,33 @@ tenere presente nel parser, anche se il 26B-A4B non è indicato come affetto.
 
 ---
 
-## 9. Punti aperti che richiedono i metadati HF [HF-PENDING]
+## 9. Punti [HF-PENDING]: esito dopo l'acquisizione dei metadati
 
-Dal download di `config.json`, `tokenizer.json`, `tokenizer_config.json`,
-`model.safetensors.index.json` di `google/gemma-4-26B-A4B-it`:
+I metadati sono in `gemma4-port/hf-metadata/`. Esito punto per punto:
 
-1. **Context window massima** (`max_position_embeddings`) ed eventuale RoPE
-   scaling nel config HF (il codice JAX usa `scale_factor=1.0` di default,
-   `_config.py:112-113`).
-2. **Nomi e shape esatti dei tensori safetensors** (naming HF-transformers vs
-   param-tree Flax; eventuale split per-esperto; dtype effettivo) — necessari
-   per il convertitore/quantizzatore.
-3. **Chat template** (byte esatti dei tag di turno, thinking, tool-calling,
-   system prompt dei tool).
-4. Conferma iperparametri di routing lato HF (`num_experts_per_tok`,
-   `norm_topk_prob`, ecc.) e dell'assenza di softcap sull'attenzione.
-5. Dimensione file totale dai metadati dell'index (attesa ~50 GB).
+1. **Context window**: `max_position_embeddings = 262144` (256k),
+   `config.json:68`. RoPE: sliding `theta=10000` tipo `default`; full
+   `theta=1000000`, `partial_rotary_factor=0.25`, tipo `proportional`
+   (`config.json:79-89`) — coerente col codice JAX, nessuno scaling YaRN.
+2. **Tensori safetensors**: nomi confermati e tabulati in §5.2; dtype bf16
+   (`config.json:9,25`); `total_size` 48.07 GiB. Le **shape** non sono
+   nell'index: verifica finale dagli header degli shard in fase di
+   conversione.
+3. **Chat template**: parzialmente chiuso. Il formato di output (thinking come
+   canale `<|channel>thought`, tool call `call:NOME{json}`, terminatori) è nel
+   `response_schema` (`tokenizer_config.json:25-65`). **Residuo**: il file
+   `chat_template.jinja` (in transformers v5 è separato dal
+   `tokenizer_config.json`) per il rendering lato input — da scaricare insieme
+   a `generation_config.json` prima della Fase 4:
+   `curl.exe -L -H "Authorization: Bearer $env:HF_TOKEN" -o chat_template.jinja https://huggingface.co/google/gemma-4-26B-A4B-it/resolve/main/chat_template.jinja`
+4. **Routing HF**: `num_experts=128`, `top_k_experts=8`,
+   `enable_moe_block=true` (`config.json:72,92,26`); nessun softcap
+   d'attenzione nel config (solo `final_logit_softcapping=30.0`,
+   `config.json:28`). Confermati anche `attention_k_eq_v=true`,
+   `global_head_dim=512`, `num_global_key_value_heads=2`,
+   `sliding_window=1024`, `rms_norm_eps=1e-06`, eos doppio `[1, 106]`.
+5. **Dimensione totale**: 51'611'872'412 byte (48.07 GiB), inclusi ~1.1 GiB
+   di vision tower — in linea con la stima §5.3 per la sola parte testo.
 
-Nessuno di questi punti cambia le conclusioni architetturali di questo
-documento; servono per fissare i dettagli esecutivi delle Fasi 2-4.
+Unico residuo: `chat_template.jinja` + `generation_config.json` (punto 3),
+necessari solo per il renderer di chat della Fase 4.
