@@ -10,7 +10,7 @@ I documenti di progetto sono in [`../gemma4-port/`](../gemma4-port/):
 3. `03-disk-kv-cache.md` — formato G4KV/G4SP e politiche di frontiera
 4. `04-piano-implementazione.md` — milestone M0-M7
 
-## Stato: M1 + tokenizer M3 validati
+## Stato: M1 + tokenizer + sessioni/G4SP validati
 
 | Modulo | Contenuto | Stato |
 |---|---|---|
@@ -23,6 +23,9 @@ I documenti di progetto sono in [`../gemma4-port/`](../gemma4-port/):
 | `tests/g4_toy_test.c` + `tests/vectors/toy.gguf` | **M1**: il forward C riproduce i logits della reference JAX vera (modello giocattolo, 6 layer LLLLLG): max diff 5e-6, argmax 21/21 | verde |
 | `g4_tokenizer.[ch]` | BPE SentencePiece-style: normalizer ▁, merges per rank, byte-fallback, special tokens greedy | fatto |
 | `tests/g4_tok_test.c` + `tests/vectors/tok_vectors.bin` | **M3 (encode)**: 30/30 casi identici a HF `tokenizers` su tokenizer.json reale (multilingua, emoji, byte-fallback, specials); tabella rigenerabile con `scripts/gen_tokenizer_vectors.py` | verde |
+| API di sessione (`g4.h`) | decode incrementale con KV persistente: ring di `sliding_window` righe sui layer locali, storia piena sui globali | fatto |
+| payload G4SP (`g4_session_save/load_payload`) | serializzazione dello stato per il disk KV (doc 03 §5), dtype f32 nel path di riferimento | fatto |
+| `tests/g4_session_test.c` | incrementale == batch; save a metà (oltre il wrap del ring) → resume in sessione nuova → continuazione **bit-esatta**; reject di shape/ctx sbagliati | verde |
 
 ```sh
 make test

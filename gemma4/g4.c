@@ -1,4 +1,4 @@
-/* g4 engine core — M1: GGUF model load + f32 reference forward pass.
+/* g4 engine core — model load, f32 forward pass, session API, G4SP payload.
  *
  * The graph follows the Gemma 4 reference implementation
  * (gemma/gm/nn/gemma4/_modules.py, _moe.py, _layers.py) and the design in
@@ -7,7 +7,11 @@
  *   - local sliding GQA + global K=V attention (_modules.py:201-419)
  *   - partial RoPE, half-split pairing (gm/math/_positional_embeddings.py)
  *   - MoE softmax->top-k->renorm + per_expert_scale (_moe.py:301-379)
- *   - parallel dense FFN branch, GeGLU, tied embeddings + softcap. */
+ *   - parallel dense FFN branch, GeGLU, tied embeddings + softcap.
+ *
+ * Sessions keep the KV state exactly as the disk design assumes
+ * (gemma4-port/03 §3): local layers hold only the last `sliding_window`
+ * rows in a ring, global layers hold the full history. */
 
 #include "g4.h"
 #include "g4_gguf.h"
@@ -293,187 +297,391 @@ static void softmax_inplace(float *x, uint32_t n) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Forward pass                                                        */
+/* Sessions                                                            */
 /* ------------------------------------------------------------------ */
 
-typedef struct {
-    float *k; /* [T, KV*K] */
-    float *v; /* [T, KV*K] */
-} g4_kv_cache;
+struct g4_session {
+    const g4_model *m;
+    uint32_t ctx;    /* token capacity */
+    uint32_t n_past; /* tokens evaluated so far */
+    int32_t *tokens; /* [ctx] history */
+    float *logits;   /* [vocab] next-token logits */
+    /* Per-layer KV state: local layers keep a ring of `sliding_window`
+     * rows (slot = pos % window), global layers keep [ctx] rows. */
+    float **ck;
+    float **cv;
+    /* Scratch. */
+    float *x, *xn, *tmp, *res, *q, *kraw, *att, *enc;
+    float *gate, *up, *ffn, *moe_out, *dense_out, *rlogits;
+};
+
+static uint32_t layer_cache_rows(const g4_model *m, uint32_t li, uint32_t ctx) {
+    return m->layer[li].is_global
+               ? ctx
+               : (ctx < m->sliding_window ? ctx : m->sliding_window);
+}
+
+static uint32_t layer_row_elems(const g4_model *m, uint32_t li) {
+    const g4_layer *l = &m->layer[li];
+    return (l->is_global ? m->n_kv_global : m->n_kv_local) *
+           (l->is_global ? m->key_global : m->key_local);
+}
+
+g4_session *g4_session_create(const g4_model *m, uint32_t ctx) {
+    if (!m || ctx == 0) return NULL;
+    g4_session *s = calloc(1, sizeof(*s));
+    s->m = m;
+    s->ctx = ctx;
+    s->tokens = malloc(sizeof(int32_t) * ctx);
+    s->logits = calloc(m->vocab, sizeof(float));
+    s->ck = calloc(m->n_layer, sizeof(float *));
+    s->cv = calloc(m->n_layer, sizeof(float *));
+    for (uint32_t i = 0; i < m->n_layer; i++) {
+        size_t n = (size_t)layer_cache_rows(m, i, ctx) * layer_row_elems(m, i);
+        s->ck[i] = malloc(sizeof(float) * n);
+        s->cv[i] = malloc(sizeof(float) * n);
+    }
+    const uint32_t D = m->d_model;
+    const uint32_t Kmax = m->key_global > m->key_local ? m->key_global
+                                                       : m->key_local;
+    const uint32_t Hbig = m->expert_dim > m->dense_ffn ? m->expert_dim
+                                                       : m->dense_ffn;
+    s->x = malloc(sizeof(float) * D);
+    s->xn = malloc(sizeof(float) * D);
+    s->tmp = malloc(sizeof(float) * D);
+    s->res = malloc(sizeof(float) * D);
+    s->q = malloc(sizeof(float) * m->n_heads * Kmax);
+    s->kraw = malloc(sizeof(float) * m->n_heads * Kmax);
+    s->att = malloc(sizeof(float) * ctx);
+    s->enc = malloc(sizeof(float) * m->n_heads * Kmax);
+    s->gate = malloc(sizeof(float) * Hbig);
+    s->up = malloc(sizeof(float) * Hbig);
+    s->ffn = malloc(sizeof(float) * D);
+    s->moe_out = malloc(sizeof(float) * D);
+    s->dense_out = malloc(sizeof(float) * D);
+    s->rlogits = malloc(sizeof(float) * m->n_experts);
+    return s;
+}
+
+void g4_session_free(g4_session *s) {
+    if (!s) return;
+    for (uint32_t i = 0; i < s->m->n_layer; i++) {
+        free(s->ck[i]);
+        free(s->cv[i]);
+    }
+    free(s->ck); free(s->cv);
+    free(s->tokens); free(s->logits);
+    free(s->x); free(s->xn); free(s->tmp); free(s->res); free(s->q);
+    free(s->kraw); free(s->att); free(s->enc); free(s->gate); free(s->up);
+    free(s->ffn); free(s->moe_out); free(s->dense_out); free(s->rlogits);
+    free(s);
+}
+
+uint32_t g4_session_pos(const g4_session *s) { return s->n_past; }
+const int32_t *g4_session_tokens(const g4_session *s) { return s->tokens; }
+const float *g4_session_logits(const g4_session *s) { return s->logits; }
+
+int g4_session_eval(g4_session *s, int32_t token) {
+    const g4_model *m = s->m;
+    const uint32_t D = m->d_model, H = m->n_heads, W = m->sliding_window;
+    const uint32_t Hexp = m->expert_dim, H2 = m->dense_ffn, E = m->n_experts;
+    const uint32_t pos = s->n_past;
+    if (pos >= s->ctx || token < 0 || (uint32_t)token >= m->vocab) return -1;
+    s->tokens[pos] = token;
+
+    float *x = s->x, *xn = s->xn, *tmp = s->tmp, *res = s->res;
+
+    /* Embedder.encode: table row * sqrt(D)  (_modules.py:112-125) */
+    const float *row = m->token_embd + (size_t)token * D;
+    const float emb_scale = sqrtf((float)D);
+    for (uint32_t d = 0; d < D; d++) x[d] = row[d] * emb_scale;
+
+    for (uint32_t li = 0; li < m->n_layer; li++) {
+        const g4_layer *l = &m->layer[li];
+        const uint32_t K = l->is_global ? m->key_global : m->key_local;
+        const uint32_t KV = l->is_global ? m->n_kv_global : m->n_kv_local;
+        const uint32_t group = H / KV;
+        const float base = l->is_global ? m->rope_global_base
+                                        : m->rope_local_base;
+        const float prop = l->is_global ? m->rope_global_prop : 1.0f;
+        const uint32_t rows = layer_cache_rows(m, li, s->ctx);
+
+        /* 1. Attention (_modules.py:619-634). */
+        rms_norm(x, l->attn_norm, xn, D, m->rms_eps);
+
+        matvec(l->wq, xn, s->q, H * K, D);
+        for (uint32_t h = 0; h < H; h++) {
+            rms_norm(s->q + h * K, l->q_norm, s->q + h * K, K, m->rms_eps);
+            apply_rope(s->q + h * K, K, pos, base, prop);
+        }
+
+        const uint32_t slot = l->is_global ? pos : pos % rows;
+        matvec(l->wk, xn, s->kraw, KV * K, D);
+        float *kdst = s->ck[li] + (size_t)slot * KV * K;
+        float *vdst = s->cv[li] + (size_t)slot * KV * K;
+        for (uint32_t h = 0; h < KV; h++) {
+            if (l->is_global && m->k_eq_v_global) {
+                /* K and V share the projection; K gets key_norm(+scale) and
+                 * RoPE, V gets value_norm (no scale), no RoPE
+                 * (_modules.py:277-295). */
+                rms_norm(s->kraw + h * K, NULL, vdst + h * K, K, m->rms_eps);
+                rms_norm(s->kraw + h * K, l->k_norm, kdst + h * K, K, m->rms_eps);
+                apply_rope(kdst + h * K, K, pos, base, prop);
+            } else {
+                rms_norm(s->kraw + h * K, l->k_norm, kdst + h * K, K, m->rms_eps);
+                apply_rope(kdst + h * K, K, pos, base, prop);
+            }
+        }
+        if (!(l->is_global && m->k_eq_v_global)) {
+            matvec(l->wv, xn, s->kraw, KV * K, D);
+            for (uint32_t h = 0; h < KV; h++)
+                rms_norm(s->kraw + h * K, NULL, vdst + h * K, K, m->rms_eps);
+        }
+
+        /* Visible span: global layers see 0..pos, local layers the last
+         * `window` positions (sliding mask, _modules.py:38-52).  With the
+         * ring these are exactly the live rows. */
+        uint32_t n_att = pos + 1;
+        if (!l->is_global && n_att > W) n_att = W;
+        const uint32_t q0 = pos + 1 - n_att;
+
+        /* Per-head attention.  No 1/sqrt(d) scaling: the reference applies
+         * none (_modules.py:322-334). */
+        for (uint32_t h = 0; h < H; h++) {
+            const uint32_t kvh = h / group;
+            for (uint32_t j = 0; j < n_att; j++) {
+                const uint32_t qpos = q0 + j;
+                const uint32_t sl = l->is_global ? qpos : qpos % rows;
+                s->att[j] = dot(s->q + h * K,
+                                s->ck[li] + ((size_t)sl * KV + kvh) * K, K);
+            }
+            softmax_inplace(s->att, n_att);
+            float *eh = s->enc + h * K;
+            memset(eh, 0, sizeof(float) * K);
+            for (uint32_t j = 0; j < n_att; j++) {
+                const uint32_t qpos = q0 + j;
+                const uint32_t sl = l->is_global ? qpos : qpos % rows;
+                const float p = s->att[j];
+                const float *vv = s->cv[li] + ((size_t)sl * KV + kvh) * K;
+                for (uint32_t d = 0; d < K; d++) eh[d] += p * vv[d];
+            }
+        }
+        matvec(l->wo, s->enc, tmp, D, H * K);
+        rms_norm(tmp, l->post_attn_norm, tmp, D, m->rms_eps);
+        for (uint32_t d = 0; d < D; d++) res[d] = x[d] + tmp[d];
+
+        /* 2. FFN: dense branch (_modules.py:674-680). */
+        rms_norm(res, l->ffn_norm_shexp, xn, D, m->rms_eps);
+        matvec(l->gate_shexp, xn, s->gate, H2, D);
+        matvec(l->up_shexp, xn, s->up, H2, D);
+        for (uint32_t hh = 0; hh < H2; hh++)
+            s->gate[hh] = gelu_tanh(s->gate[hh]) * s->up[hh];
+        matvec(l->down_shexp, s->gate, s->dense_out, D, H2);
+        rms_norm(s->dense_out, l->post_ffn_norm_shexp, s->dense_out, D,
+                 m->rms_eps);
+
+        /* 2b. MoE branch (_moe.py:381-407): the router reads the
+         * UN-normalized residual through its own scale-less RMSNorm. */
+        rms_norm(res, NULL, tmp, D, m->rms_eps);
+        const float root = 1.0f / sqrtf((float)D);
+        for (uint32_t d = 0; d < D; d++)
+            tmp[d] = tmp[d] * root * l->router_scale[d];
+        matvec(l->router, tmp, s->rlogits, E, D);
+        softmax_inplace(s->rlogits, E); /* probs now */
+
+        /* exact top-k by probability (== by logit) */
+        uint32_t sel[64];
+        float wsum = 0.0f;
+        for (uint32_t j = 0; j < m->top_k; j++) {
+            uint32_t best = 0;
+            float bp = -1.0f;
+            for (uint32_t e = 0; e < E; e++) {
+                bool taken = false;
+                for (uint32_t t2 = 0; t2 < j; t2++)
+                    if (sel[t2] == e) { taken = true; break; }
+                if (!taken && s->rlogits[e] > bp) { bp = s->rlogits[e]; best = e; }
+            }
+            sel[j] = best;
+            wsum += s->rlogits[best];
+        }
+        if (wsum <= 0.0f) wsum = 1.0f; /* _moe.py:32-35 */
+
+        rms_norm(res, l->ffn_norm, xn, D, m->rms_eps);
+        memset(s->moe_out, 0, sizeof(float) * D);
+        for (uint32_t j = 0; j < m->top_k; j++) {
+            const uint32_t e = sel[j];
+            const float w = s->rlogits[e] / wsum;
+            const float pes = l->per_expert_scale[e];
+            matvec(l->gate_exps + (size_t)e * Hexp * D, xn, s->gate, Hexp, D);
+            matvec(l->up_exps + (size_t)e * Hexp * D, xn, s->up, Hexp, D);
+            for (uint32_t hh = 0; hh < Hexp; hh++)
+                s->gate[hh] = gelu_tanh(s->gate[hh]) * s->up[hh];
+            matvec(l->down_exps + (size_t)e * D * Hexp, s->gate, s->ffn, D, Hexp);
+            for (uint32_t d = 0; d < D; d++)
+                s->moe_out[d] += w * pes * s->ffn[d];
+        }
+        rms_norm(s->moe_out, l->post_ffn_norm_moe, s->moe_out, D, m->rms_eps);
+
+        /* Combine + residual + skip_scale (_modules.py:636-663,686-693). */
+        for (uint32_t d = 0; d < D; d++)
+            s->ffn[d] = s->dense_out[d] + s->moe_out[d];
+        rms_norm(s->ffn, l->post_ffn_norm, s->ffn, D, m->rms_eps);
+        for (uint32_t d = 0; d < D; d++)
+            x[d] = (res[d] + s->ffn[d]) * l->skip_scale[0];
+    }
+
+    /* Final norm + tied decode + softcap (_transformer.py:332-336). */
+    rms_norm(x, m->output_norm, xn, D, m->rms_eps);
+    matvec(m->token_embd, xn, s->logits, m->vocab, D);
+    for (uint32_t v = 0; v < m->vocab; v++)
+        s->logits[v] = tanhf(s->logits[v] / m->softcap) * m->softcap;
+
+    s->n_past = pos + 1;
+    return 0;
+}
 
 int g4_forward_prefill_f32(const g4_model *m, const int32_t *tokens,
                            uint32_t n_tokens, float *logits) {
-    const uint32_t D = m->d_model, H = m->n_heads;
-    const uint32_t Kmax = m->key_global > m->key_local ? m->key_global
-                                                       : m->key_local;
-    const uint32_t Hexp = m->expert_dim, H2 = m->dense_ffn, E = m->n_experts;
-
-    g4_kv_cache *cache = calloc(m->n_layer, sizeof(*cache));
-    for (uint32_t i = 0; i < m->n_layer; i++) {
-        const g4_layer *l = &m->layer[i];
-        uint32_t K = l->is_global ? m->key_global : m->key_local;
-        uint32_t KV = l->is_global ? m->n_kv_global : m->n_kv_local;
-        cache[i].k = malloc(sizeof(float) * (size_t)n_tokens * KV * K);
-        cache[i].v = malloc(sizeof(float) * (size_t)n_tokens * KV * K);
-    }
-
-    float *x = malloc(sizeof(float) * D);
-    float *xn = malloc(sizeof(float) * D);
-    float *tmp = malloc(sizeof(float) * D);
-    float *res = malloc(sizeof(float) * D);
-    float *q = malloc(sizeof(float) * H * Kmax);
-    float *kraw = malloc(sizeof(float) * H * Kmax);
-    float *att = malloc(sizeof(float) * n_tokens);
-    float *enc = malloc(sizeof(float) * H * Kmax);
-    float *gate = malloc(sizeof(float) * (Hexp > H2 ? Hexp : H2));
-    float *up = malloc(sizeof(float) * (Hexp > H2 ? Hexp : H2));
-    float *ffn = malloc(sizeof(float) * D);
-    float *moe_out = malloc(sizeof(float) * D);
-    float *dense_out = malloc(sizeof(float) * D);
-    float *rlogits = malloc(sizeof(float) * E);
-
-    for (uint32_t pos = 0; pos < n_tokens; pos++) {
-        /* Embedder.encode: table row * sqrt(D)  (_modules.py:112-125) */
-        const float *row = m->token_embd + (size_t)tokens[pos] * D;
-        float emb_scale = sqrtf((float)D);
-        for (uint32_t d = 0; d < D; d++) x[d] = row[d] * emb_scale;
-
-        for (uint32_t li = 0; li < m->n_layer; li++) {
-            const g4_layer *l = &m->layer[li];
-            const uint32_t K = l->is_global ? m->key_global : m->key_local;
-            const uint32_t KV = l->is_global ? m->n_kv_global : m->n_kv_local;
-            const uint32_t group = H / KV;
-            const float base = l->is_global ? m->rope_global_base
-                                            : m->rope_local_base;
-            const float prop = l->is_global ? m->rope_global_prop : 1.0f;
-
-            /* 1. Attention (_modules.py:619-634). */
-            rms_norm(x, l->attn_norm, xn, D, m->rms_eps);
-
-            matvec(l->wq, xn, q, H * K, D);
-            for (uint32_t h = 0; h < H; h++) {
-                rms_norm(q + h * K, l->q_norm, q + h * K, K, m->rms_eps);
-                apply_rope(q + h * K, K, pos, base, prop);
-            }
-
-            matvec(l->wk, xn, kraw, KV * K, D);
-            float *kdst = cache[li].k + (size_t)pos * KV * K;
-            float *vdst = cache[li].v + (size_t)pos * KV * K;
-            for (uint32_t h = 0; h < KV; h++) {
-                if (l->is_global && m->k_eq_v_global) {
-                    /* K and V share the projection; K gets key_norm(+scale)
-                     * and RoPE, V gets value_norm (no scale), no RoPE
-                     * (_modules.py:277-295). */
-                    rms_norm(kraw + h * K, NULL, vdst + h * K, K, m->rms_eps);
-                    rms_norm(kraw + h * K, l->k_norm, kdst + h * K, K, m->rms_eps);
-                    apply_rope(kdst + h * K, K, pos, base, prop);
-                } else {
-                    rms_norm(kraw + h * K, l->k_norm, kdst + h * K, K, m->rms_eps);
-                    apply_rope(kdst + h * K, K, pos, base, prop);
-                }
-            }
-            if (!(l->is_global && m->k_eq_v_global)) {
-                matvec(l->wv, xn, kraw, KV * K, D);
-                for (uint32_t h = 0; h < KV; h++)
-                    rms_norm(kraw + h * K, NULL, vdst + h * K, K, m->rms_eps);
-            }
-
-            /* Per-head attention over positions 0..pos.  No 1/sqrt(d)
-             * scaling: the reference applies none (_modules.py:322-334). */
-            for (uint32_t h = 0; h < H; h++) {
-                const uint32_t kvh = h / group;
-                uint32_t s0 = 0;
-                if (!l->is_global && pos + 1 > m->sliding_window)
-                    s0 = pos + 1 - m->sliding_window; /* s > pos - window */
-                for (uint32_t s = s0; s <= pos; s++)
-                    att[s - s0] = dot(q + h * K,
-                                      cache[li].k + ((size_t)s * KV + kvh) * K, K);
-                softmax_inplace(att, pos - s0 + 1);
-                float *eh = enc + h * K;
-                memset(eh, 0, sizeof(float) * K);
-                for (uint32_t s = s0; s <= pos; s++) {
-                    const float p = att[s - s0];
-                    const float *vv = cache[li].v + ((size_t)s * KV + kvh) * K;
-                    for (uint32_t d = 0; d < K; d++) eh[d] += p * vv[d];
-                }
-            }
-            matvec(l->wo, enc, tmp, D, H * K);
-            rms_norm(tmp, l->post_attn_norm, tmp, D, m->rms_eps);
-            for (uint32_t d = 0; d < D; d++) res[d] = x[d] + tmp[d];
-
-            /* 2. FFN: dense branch (_modules.py:674-680). */
-            rms_norm(res, l->ffn_norm_shexp, xn, D, m->rms_eps);
-            matvec(l->gate_shexp, xn, gate, H2, D);
-            matvec(l->up_shexp, xn, up, H2, D);
-            for (uint32_t hh = 0; hh < H2; hh++)
-                gate[hh] = gelu_tanh(gate[hh]) * up[hh];
-            matvec(l->down_shexp, gate, dense_out, D, H2);
-            rms_norm(dense_out, l->post_ffn_norm_shexp, dense_out, D, m->rms_eps);
-
-            /* 2b. MoE branch (_moe.py:381-407): the router reads the
-             * UN-normalized residual through its own scale-less RMSNorm. */
-            rms_norm(res, NULL, tmp, D, m->rms_eps);
-            const float root = 1.0f / sqrtf((float)D);
-            for (uint32_t d = 0; d < D; d++)
-                tmp[d] = tmp[d] * root * l->router_scale[d];
-            matvec(l->router, tmp, rlogits, E, D);
-            softmax_inplace(rlogits, E); /* probs now */
-
-            /* exact top-k by probability (== by logit) */
-            uint32_t sel[64];
-            float wsum = 0.0f;
-            for (uint32_t j = 0; j < m->top_k; j++) {
-                uint32_t best = 0;
-                float bp = -1.0f;
-                for (uint32_t e = 0; e < E; e++) {
-                    bool taken = false;
-                    for (uint32_t t2 = 0; t2 < j; t2++)
-                        if (sel[t2] == e) { taken = true; break; }
-                    if (!taken && rlogits[e] > bp) { bp = rlogits[e]; best = e; }
-                }
-                sel[j] = best;
-                wsum += rlogits[best];
-            }
-            if (wsum <= 0.0f) wsum = 1.0f; /* _moe.py:32-35 */
-
-            rms_norm(res, l->ffn_norm, xn, D, m->rms_eps);
-            memset(moe_out, 0, sizeof(float) * D);
-            for (uint32_t j = 0; j < m->top_k; j++) {
-                const uint32_t e = sel[j];
-                const float w = rlogits[e] / wsum;
-                const float pes = l->per_expert_scale[e];
-                matvec(l->gate_exps + (size_t)e * Hexp * D, xn, gate, Hexp, D);
-                matvec(l->up_exps + (size_t)e * Hexp * D, xn, up, Hexp, D);
-                for (uint32_t hh = 0; hh < Hexp; hh++)
-                    gate[hh] = gelu_tanh(gate[hh]) * up[hh];
-                matvec(l->down_exps + (size_t)e * D * Hexp, gate, ffn, D, Hexp);
-                for (uint32_t d = 0; d < D; d++)
-                    moe_out[d] += w * pes * ffn[d];
-            }
-            rms_norm(moe_out, l->post_ffn_norm_moe, moe_out, D, m->rms_eps);
-
-            /* Combine + residual + skip_scale (_modules.py:636-663,686-693). */
-            for (uint32_t d = 0; d < D; d++) ffn[d] = dense_out[d] + moe_out[d];
-            rms_norm(ffn, l->post_ffn_norm, ffn, D, m->rms_eps);
-            for (uint32_t d = 0; d < D; d++)
-                x[d] = (res[d] + ffn[d]) * l->skip_scale[0];
+    g4_session *s = g4_session_create(m, n_tokens);
+    if (!s) return -1;
+    for (uint32_t p = 0; p < n_tokens; p++) {
+        if (g4_session_eval(s, tokens[p])) {
+            g4_session_free(s);
+            return -1;
         }
-
-        /* Final norm + tied decode + softcap (_transformer.py:332-336). */
-        rms_norm(x, m->output_norm, xn, D, m->rms_eps);
-        float *lg = logits + (size_t)pos * m->vocab;
-        matvec(m->token_embd, xn, lg, m->vocab, D);
-        for (uint32_t v = 0; v < m->vocab; v++)
-            lg[v] = tanhf(lg[v] / m->softcap) * m->softcap;
+        memcpy(logits + (size_t)p * m->vocab, s->logits,
+               sizeof(float) * m->vocab);
     }
-
-    for (uint32_t i = 0; i < m->n_layer; i++) {
-        free(cache[i].k);
-        free(cache[i].v);
-    }
-    free(cache);
-    free(x); free(xn); free(tmp); free(res); free(q); free(kraw);
-    free(att); free(enc); free(gate); free(up); free(ffn);
-    free(moe_out); free(dense_out); free(rlogits);
+    g4_session_free(s);
     return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* G4SP payload (gemma4-port/03-disk-kv-cache.md §5)                   */
+/* ------------------------------------------------------------------ */
+
+uint64_t g4_session_payload_bytes(const g4_session *s) {
+    const g4_model *m = s->m;
+    const uint32_t T = s->n_past;
+    uint64_t bytes = 4u * G4_SESSION_PAYLOAD_U32_FIELDS;
+    bytes += 4ull * T;              /* tokens */
+    bytes += 4ull * m->vocab;       /* logits */
+    for (uint32_t li = 0; li < m->n_layer; li++) {
+        uint32_t R = m->layer[li].is_global
+                         ? T
+                         : (T < m->sliding_window ? T : m->sliding_window);
+        bytes += 4 + 2ull * 4ull * R * layer_row_elems(m, li);
+    }
+    return bytes;
+}
+
+static int payload_header(const g4_session *s, uint32_t h[G4_SESSION_PAYLOAD_U32_FIELDS]) {
+    const g4_model *m = s->m;
+    memcpy(&h[0], "G4SP", 4);
+    h[1] = G4_SESSION_PAYLOAD_VERSION;
+    h[2] = s->ctx;
+    h[3] = 0; /* prefill chunk: single-token reference path */
+    h[4] = m->n_layer;
+    h[5] = m->pattern_period;
+    h[6] = m->sliding_window;
+    h[7] = m->n_kv_local;
+    h[8] = m->key_local;
+    h[9] = m->n_kv_global;
+    h[10] = m->key_global;
+    h[11] = m->vocab;
+    h[12] = s->n_past;
+    h[13] = 1; /* kv dtype: f32 */
+    h[14] = 1; /* flags: logits present */
+    h[15] = 0;
+    return 0;
+}
+
+int g4_session_save_payload(const g4_session *s, FILE *fp,
+                            char *err, size_t errlen) {
+    const g4_model *m = s->m;
+    const uint32_t T = s->n_past;
+    uint32_t h[G4_SESSION_PAYLOAD_U32_FIELDS];
+    payload_header(s, h);
+    if (fwrite(h, 4, G4_SESSION_PAYLOAD_U32_FIELDS, fp) !=
+        G4_SESSION_PAYLOAD_U32_FIELDS)
+        goto werr;
+    if (T && fwrite(s->tokens, 4, T, fp) != T) goto werr;
+    if (fwrite(s->logits, 4, m->vocab, fp) != m->vocab) goto werr;
+
+    for (uint32_t li = 0; li < m->n_layer; li++) {
+        const bool g = m->layer[li].is_global;
+        const uint32_t rows_cap = layer_cache_rows(m, li, s->ctx);
+        const uint32_t elems = layer_row_elems(m, li);
+        const uint32_t R = g ? T : (T < m->sliding_window ? T : m->sliding_window);
+        if (fwrite(&R, 4, 1, fp) != 1) goto werr;
+        /* Rows in logical position order T-R..T-1 (doc 03 §3). */
+        for (int pass = 0; pass < 2; pass++) {
+            const float *cache = pass == 0 ? s->ck[li] : s->cv[li];
+            for (uint32_t j = 0; j < R; j++) {
+                const uint32_t qpos = T - R + j;
+                const uint32_t sl = g ? qpos : qpos % rows_cap;
+                if (fwrite(cache + (size_t)sl * elems, 4, elems, fp) != elems)
+                    goto werr;
+            }
+        }
+    }
+    return 0;
+werr:
+    seterr(err, errlen, "payload write failed%s", "");
+    return -1;
+}
+
+int g4_session_load_payload(g4_session *s, FILE *fp, char *err, size_t errlen) {
+    const g4_model *m = s->m;
+    uint32_t h[G4_SESSION_PAYLOAD_U32_FIELDS];
+    if (fread(h, 4, G4_SESSION_PAYLOAD_U32_FIELDS, fp) !=
+        G4_SESSION_PAYLOAD_U32_FIELDS)
+    {
+        seterr(err, errlen, "payload header read failed%s", "");
+        return -1;
+    }
+    if (memcmp(&h[0], "G4SP", 4) || h[1] != G4_SESSION_PAYLOAD_VERSION ||
+        h[4] != m->n_layer || h[5] != m->pattern_period ||
+        h[6] != m->sliding_window || h[7] != m->n_kv_local ||
+        h[8] != m->key_local || h[9] != m->n_kv_global ||
+        h[10] != m->key_global || h[11] != m->vocab || h[13] != 1)
+    {
+        seterr(err, errlen, "payload does not match the model shape%s", "");
+        return -1;
+    }
+    const uint32_t T = h[12];
+    if (T > s->ctx) {
+        seterr(err, errlen, "payload longer than session context%s", "");
+        return -1;
+    }
+    if (T && fread(s->tokens, 4, T, fp) != T) goto rerr;
+    if (fread(s->logits, 4, m->vocab, fp) != m->vocab) goto rerr;
+
+    for (uint32_t li = 0; li < m->n_layer; li++) {
+        const bool g = m->layer[li].is_global;
+        const uint32_t rows_cap = layer_cache_rows(m, li, s->ctx);
+        const uint32_t elems = layer_row_elems(m, li);
+        uint32_t R;
+        if (fread(&R, 4, 1, fp) != 1) goto rerr;
+        const uint32_t expect =
+            g ? T : (T < m->sliding_window ? T : m->sliding_window);
+        if (R != expect) {
+            seterr(err, errlen, "payload row count mismatch%s", "");
+            return -1;
+        }
+        for (int pass = 0; pass < 2; pass++) {
+            float *cache = pass == 0 ? s->ck[li] : s->cv[li];
+            for (uint32_t j = 0; j < R; j++) {
+                const uint32_t qpos = T - R + j;
+                const uint32_t sl = g ? qpos : qpos % rows_cap;
+                if (fread(cache + (size_t)sl * elems, 4, elems, fp) != elems)
+                    goto rerr;
+            }
+        }
+    }
+    s->n_past = T;
+    return 0;
+rerr:
+    seterr(err, errlen, "payload read failed%s", "");
+    return -1;
 }
