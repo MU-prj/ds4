@@ -357,20 +357,34 @@ static uint64_t pad_to_block(g4q_type t, uint64_t ncols) {
 
 /* Verifies the HF shape for a plan item and dies with a clear message on a
  * transposed/unexpected layout (contract: gemma4-port/02 §6). */
+static void die_shape(const char *hname, const st_tensor *t, const char *want) {
+    fprintf(stderr, "g4-quantize: unexpected layout for %s: got [", hname);
+    for (uint32_t i = 0; i < t->n_dims; i++)
+        fprintf(stderr, "%s%llu", i ? ", " : "",
+                (unsigned long long)t->dims[i]);
+    fprintf(stderr, "], want %s — see gemma4-port/02 §6\n", want);
+    exit(1);
+}
+
+/* The two expert layouts both occur in the wild ([E, D, 2H] packed vs
+ * [E, 2H, D] flattened-JAX); d_model differs from every other axis, so the
+ * shape identifies the variant unambiguously — this is detection, not
+ * guessing. */
 static void check_shape(const g4cfg *c, const plan_item *p, const st_tensor *t) {
     const uint64_t D = c->d_model;
+    const uint64_t H2x = 2ull * c->hexp;
     switch (p->tr) {
         case TR_GATE: case TR_UP:
             if (t->n_dims != 3 || t->dims[0] != c->experts ||
-                t->dims[1] != D || t->dims[2] != 2ull * c->hexp)
-                die("unexpected gate_up_proj layout for %s (want [E, D, 2*Hexp]); "
-                    "refusing to guess — see gemma4-port/02 §6", p->hname);
+                !((t->dims[1] == D && t->dims[2] == H2x) ||
+                  (t->dims[1] == H2x && t->dims[2] == D)))
+                die_shape(p->hname, t, "[E, D, 2*Hexp] or [E, 2*Hexp, D]");
             return;
         case TR_DOWN:
             if (t->n_dims != 3 || t->dims[0] != c->experts ||
-                t->dims[1] != c->hexp || t->dims[2] != D)
-                die("unexpected down_proj layout for %s (want [E, Hexp, D]); "
-                    "refusing to guess — see gemma4-port/02 §6", p->hname);
+                !((t->dims[1] == c->hexp && t->dims[2] == D) ||
+                  (t->dims[1] == D && t->dims[2] == c->hexp)))
+                die_shape(p->hname, t, "[E, Hexp, D] or [E, D, Hexp]");
             return;
         case TR_NONE: {
             /* rows of dims[0], count = product of the rest */
@@ -395,6 +409,7 @@ int main(int argc, char **argv) {
     const char *hf_dir = NULL, *out_path = NULL, *cmp_name = NULL;
     const char *profile = "q8";
     bool dry_run = false;
+    bool swap_gate_up = false;
     g4q_type ty_experts = G4Q_TYPE_COUNT, ty_down = G4Q_TYPE_COUNT;
     g4q_type ty_dense = G4Q_TYPE_COUNT, ty_attn = G4Q_TYPE_COUNT;
     g4q_type ty_embed = G4Q_TYPE_COUNT;
@@ -405,6 +420,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--out")) out_path = VAL();
         else if (!strcmp(argv[i], "--profile")) profile = VAL();
         else if (!strcmp(argv[i], "--dry-run")) dry_run = true;
+        else if (!strcmp(argv[i], "--swap-gate-up")) swap_gate_up = true;
         else if (!strcmp(argv[i], "--compare-tensor")) cmp_name = VAL();
         else if (!strcmp(argv[i], "--experts")) ty_experts = (g4q_type)atoi(VAL());
         else if (!strcmp(argv[i], "--routed-down")) ty_down = (g4q_type)atoi(VAL());
@@ -582,20 +598,40 @@ int main(int argc, char **argv) {
             rowsbuf = xmalloc(sizeof(float) * (size_t)rows * ncols);
             const uint64_t E = c.experts, H = c.hexp;
             if (p->tr == TR_GATE || p->tr == TR_UP) {
-                /* src [E, D, 2H] -> rows [(e,h)][d] */
-                uint64_t half = p->tr == TR_GATE ? 0 : H;
-                for (uint64_t e = 0; e < E; e++)
-                    for (uint64_t hh = 0; hh < H; hh++)
-                        for (uint64_t d2 = 0; d2 < D; d2++)
-                            rowsbuf[(e * H + hh) * D + d2] =
-                                src[(e * D + d2) * 2 * H + half + hh];
-            } else { /* TR_DOWN: src [E, H, D] -> rows [(e,d)][h(+pad)] */
-                memset(rowsbuf, 0, sizeof(float) * (size_t)rows * ncols);
-                for (uint64_t e = 0; e < E; e++)
-                    for (uint64_t d2 = 0; d2 < D; d2++)
+                bool want_gate = (p->tr == TR_GATE) != swap_gate_up;
+                uint64_t half = want_gate ? 0 : H;
+                if (t->dims[1] == D) {
+                    /* src [E, D, 2H] -> rows [(e,h)][d] */
+                    for (uint64_t e = 0; e < E; e++)
                         for (uint64_t hh = 0; hh < H; hh++)
-                            rowsbuf[(e * D + d2) * ncols + hh] =
-                                src[(e * H + hh) * D + d2];
+                            for (uint64_t d2 = 0; d2 < D; d2++)
+                                rowsbuf[(e * H + hh) * D + d2] =
+                                    src[(e * D + d2) * 2 * H + half + hh];
+                } else {
+                    /* src [E, 2H, D] -> rows [(e,h)][d] (contiguous copy) */
+                    for (uint64_t e = 0; e < E; e++)
+                        for (uint64_t hh = 0; hh < H; hh++)
+                            memcpy(rowsbuf + (e * H + hh) * D,
+                                   src + (e * 2 * H + half + hh) * D,
+                                   sizeof(float) * (size_t)D);
+                }
+            } else { /* TR_DOWN -> rows [(e,d)][h(+pad)] */
+                memset(rowsbuf, 0, sizeof(float) * (size_t)rows * ncols);
+                if (t->dims[1] == c.hexp) {
+                    /* src [E, H, D] */
+                    for (uint64_t e = 0; e < E; e++)
+                        for (uint64_t d2 = 0; d2 < D; d2++)
+                            for (uint64_t hh = 0; hh < H; hh++)
+                                rowsbuf[(e * D + d2) * ncols + hh] =
+                                    src[(e * H + hh) * D + d2];
+                } else {
+                    /* src [E, D, H] (contiguous copy into padded rows) */
+                    for (uint64_t e = 0; e < E; e++)
+                        for (uint64_t d2 = 0; d2 < D; d2++)
+                            memcpy(rowsbuf + (e * D + d2) * ncols,
+                                   src + (e * D + d2) * H,
+                                   sizeof(float) * (size_t)H);
+                }
             }
         }
 
