@@ -88,6 +88,7 @@ def main():
         sys.exit("usage: gen_synthetic_hf.py OUT_DIR [--f32]")
     out = sys.argv[1]
     use_f32 = "--f32" in sys.argv[2:]
+    real_layout = "--real-layout" in sys.argv[2:]
     os.makedirs(out, exist_ok=True)
     meta, g = read_gguf(TOY)
 
@@ -113,15 +114,22 @@ def main():
         hf[o + "router.proj.weight"] = g[p + "ffn_gate_inp.weight"]
         hf[o + "router.scale"] = g[p + "router_scale"]
         hf[o + "router.per_expert_scale"] = g[p + "per_expert_scale"]
-        # gate/up: gguf [E, Hexp, D] (numpy) -> hf [E, D, 2*Hexp]
+        # gate/up (gguf [E, Hexp, D]) and down (gguf [E, D, Hexp]).  Two HF
+        # layouts occur in practice; --real-layout matches
+        # google/gemma-4-26B-A4B-it (gate_up [E, 2*Hexp, D], down [E, D, Hexp]),
+        # the default matches the older packed layout ([E, D, 2*Hexp],
+        # down [E, Hexp, D]).  Both must convert to identical GGUF.
         gate = g[p + "ffn_gate_exps.weight"]
         up = g[p + "ffn_up_exps.weight"]
-        hf[o + "experts.gate_up_proj"] = np.concatenate(
-            [np.transpose(gate, (0, 2, 1)), np.transpose(up, (0, 2, 1))],
-            axis=2)
-        # down: gguf [E, D, Hexp] -> hf [E, Hexp, D]
-        hf[o + "experts.down_proj"] = np.transpose(
-            g[p + "ffn_down_exps.weight"], (0, 2, 1))
+        down = g[p + "ffn_down_exps.weight"]
+        if real_layout:
+            hf[o + "experts.gate_up_proj"] = np.concatenate([gate, up], axis=1)
+            hf[o + "experts.down_proj"] = down
+        else:
+            hf[o + "experts.gate_up_proj"] = np.concatenate(
+                [np.transpose(gate, (0, 2, 1)), np.transpose(up, (0, 2, 1))],
+                axis=2)
+            hf[o + "experts.down_proj"] = np.transpose(down, (0, 2, 1))
         hf[o + "mlp.gate_proj.weight"] = g[p + "ffn_gate_shexp.weight"]
         hf[o + "mlp.up_proj.weight"] = g[p + "ffn_up_shexp.weight"]
         hf[o + "mlp.down_proj.weight"] = g[p + "ffn_down_shexp.weight"]

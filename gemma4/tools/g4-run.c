@@ -103,23 +103,34 @@ int main(int argc, char **argv) {
     uint32_t ctx = n_prompt + (uint32_t)n_predict + 8;
     g4_session *s = g4_session_create(m, ctx);
 
-    fprintf(stderr, "prompt: %u tokens. generating...\n\n", n_prompt);
+    fprintf(stderr, "prompt: %u tokens. prefill (skips logits until last)...\n",
+            n_prompt);
     printf("%s", prompt);
     fflush(stdout);
 
-    double tgen = (double)clock() / CLOCKS_PER_SEC;
-    for (uint32_t p = 0; p < n_prompt; p++)
-        if (g4_session_eval(s, ids[p])) { fprintf(stderr, "eval failed\n"); return 1; }
+    double tpre = (double)clock() / CLOCKS_PER_SEC;
+    for (uint32_t p = 0; p < n_prompt; p++) {
+        /* Only the last prompt token needs logits to seed generation. */
+        bool want = (p + 1 == n_prompt);
+        if (g4_session_eval_ex(s, ids[p], want)) {
+            fprintf(stderr, "\neval failed\n"); return 1;
+        }
+        fprintf(stderr, "\r  prefill %u/%u (%.1fs)", p + 1, n_prompt,
+                (double)clock() / CLOCKS_PER_SEC - tpre);
+    }
+    fprintf(stderr, "\ngenerating (a dot per token):\n");
 
     uint64_t rng = seed;
     int eos_a = 1, eos_b = 106;
+    int generated = 0;
+    const char *stop = "reached -n limit";
+    double tgen = (double)clock() / CLOCKS_PER_SEC;
     for (int i = 0; i < n_predict; i++) {
         int next = sample(g4_session_logits(s), g4_model_vocab(m), temp, top_k, &rng);
-        if (next == eos_a || next == eos_b) break;
+        if (next == eos_a || next == eos_b) { stop = "EOS"; break; }
         uint32_t len;
         const char *txt = g4_tokenizer_token_text(tok, (uint32_t)next, &len);
         if (txt) {
-            /* U+2581 -> space for display. */
             for (uint32_t c = 0; c < len; c++) {
                 if (c + 2 < len && (uint8_t)txt[c] == 0xe2 &&
                     (uint8_t)txt[c+1] == 0x96 && (uint8_t)txt[c+2] == 0x81) {
@@ -128,12 +139,14 @@ int main(int argc, char **argv) {
             }
             fflush(stdout);
         }
-        if (g4_session_eval(s, next)) { fprintf(stderr, "eval failed\n"); return 1; }
+        fputc('.', stderr);  /* heartbeat: one dot per generated token */
+        generated++;
+        if (g4_session_eval(s, next)) { fprintf(stderr, "\neval failed\n"); return 1; }
     }
     double dt = (double)clock() / CLOCKS_PER_SEC - tgen;
     printf("\n\n");
-    fprintf(stderr, "done: %d tokens, %.1fs (%.2f tok/s CPU time)\n",
-            n_predict, dt, n_predict / (dt > 0 ? dt : 1));
+    fprintf(stderr, "\ndone: %d tokens, stop=%s, %.1fs (%.2f tok/s CPU)\n",
+            generated, stop, dt, generated / (dt > 0 ? dt : 1));
 
     g4_session_free(s);
     g4_tokenizer_free(tok);

@@ -517,6 +517,14 @@ const int32_t *g4_session_tokens(const g4_session *s) { return s->tokens; }
 const float *g4_session_logits(const g4_session *s) { return s->logits; }
 
 int g4_session_eval(g4_session *s, int32_t token) {
+    return g4_session_eval_ex(s, token, true);
+}
+
+/* want_logits=false updates the KV state but skips the final norm + tied
+ * vocab decode (the most expensive step, a 262144-row matmul over a ~738 MB
+ * embedding table).  Prefill uses it for every token except the last, which
+ * avoids re-reading the whole embedding table once per prompt token. */
+int g4_session_eval_ex(g4_session *s, int32_t token, bool want_logits) {
     const g4_model *m = s->m;
     const uint32_t D = m->d_model, H = m->n_heads, W = m->sliding_window;
     const uint32_t Hexp = m->expert_dim, H2 = m->dense_ffn, E = m->n_experts;
@@ -672,6 +680,9 @@ int g4_session_eval(g4_session *s, int32_t token) {
             x[d] = (res[d] + s->ffn[d]) * l->skip_scale[0];
     }
 
+    s->n_past = pos + 1;
+    if (!want_logits) return 0;
+
     /* Final norm + tied decode + softcap (_transformer.py:332-336).  In
      * frugal mode the vocab-sized embedding matrix is dequantized in bounded
      * row-chunks so the LM head never materializes in full. */
@@ -689,7 +700,6 @@ int g4_session_eval(g4_session *s, int32_t token) {
     for (uint32_t v = 0; v < m->vocab; v++)
         s->logits[v] = tanhf(s->logits[v] / m->softcap) * m->softcap;
 
-    s->n_past = pos + 1;
     return 0;
 }
 

@@ -46,6 +46,11 @@ test-converter: g4-quantize g4_toy_test
 	./g4_toy_test /tmp/g4-synth-f32.gguf tests/vectors/toy.gguf 5e-3
 	@echo "-- same model, frugal mmap path --"
 	./g4_toy_test /tmp/g4-synth-f32.gguf tests/vectors/toy.gguf 5e-3 mmap
+	@echo "-- real checkpoint expert layout ([E,2H,D] / [E,D,Hexp]) --"
+	python3 scripts/gen_synthetic_hf.py /tmp/g4-synth-real --f32 --real-layout
+	./g4-quantize --hf /tmp/g4-synth-real --out /tmp/g4-synth-real.gguf --profile f32
+	./g4_toy_test /tmp/g4-synth-real.gguf tests/vectors/toy.gguf 5e-3
+	./g4_toy_test /tmp/g4-synth-real.gguf tests/vectors/toy.gguf 5e-3 mmap
 	@echo "-- q8 conversion, frugal mmap path (smoke: finite output) --"
 	python3 scripts/gen_synthetic_hf.py /tmp/g4-synth-hf
 	./g4-quantize --hf /tmp/g4-synth-hf --out /tmp/g4-synth-q8.gguf --profile q8

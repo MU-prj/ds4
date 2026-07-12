@@ -36,6 +36,10 @@ const int32_t *g4_session_tokens(const g4_session *s);
 const float *g4_session_logits(const g4_session *s);
 /* Evaluates one token at the current position.  Returns 0 on success. */
 int g4_session_eval(g4_session *s, int32_t token);
+/* As above, but when want_logits is false the (expensive) tied vocab decode
+ * is skipped and only the KV state advances.  Use it for all prompt tokens
+ * except the one whose logits you need. */
+int g4_session_eval_ex(g4_session *s, int32_t token, bool want_logits);
 
 /* G4SP payload (gemma4-port/03 §5).  kv dtype: 0=bf16, 1=f32; this f32
  * reference engine writes and expects dtype 1, so save->load->continue is
