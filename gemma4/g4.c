@@ -24,14 +24,27 @@
 
 #define G4_K_MASK -2.3819763e38f /* _modules.py:26 */
 
+/* A large weight matrix.  In RAM mode `f` holds the dequantized f32 rows.
+ * In frugal (mmap) mode `q` points at the quantized bytes inside the mapped
+ * GGUF and rows are dequantized on demand into session scratch — so a model
+ * far larger than RAM still runs (gemma4-port/03 §9, the ds4 idea). */
+typedef struct {
+    float *f;          /* preloaded f32 rows, or NULL when lazy */
+    const uint8_t *q;  /* mmap'd quantized bytes, or NULL when preloaded */
+    uint32_t type;     /* g4q_type (used when lazy) */
+    uint64_t nrows;
+    uint32_t ncols;    /* row length = contraction dim (dims[0]) */
+    size_t row_bytes;
+} g4_wt;
+
 typedef struct {
     /* Attention. */
     float *attn_norm;      /* [D] pre_attention_norm */
     float *post_attn_norm; /* [D] */
-    float *wq;             /* [H*K, D] */
-    float *wk;             /* [KV*K, D] */
-    float *wv;             /* [KV*K, D], NULL on global layers (K=V) */
-    float *wo;             /* [D, H*K] */
+    g4_wt wq;              /* [H*K, D] */
+    g4_wt wk;              /* [KV*K, D] */
+    g4_wt wv;              /* [KV*K, D], unset on global layers (K=V) */
+    g4_wt wo;              /* [D, H*K] */
     float *q_norm;         /* [K] */
     float *k_norm;         /* [K] */
     /* MoE branch. */
@@ -40,15 +53,15 @@ typedef struct {
     float *router;             /* [E, D] */
     float *router_scale;       /* [D] */
     float *per_expert_scale;   /* [E] */
-    float *gate_exps;          /* [E, Hexp, D] */
-    float *up_exps;            /* [E, Hexp, D] */
-    float *down_exps;          /* [E, D, Hexp] */
+    g4_wt gate_exps;          /* [E, Hexp, D] */
+    g4_wt up_exps;            /* [E, Hexp, D] */
+    g4_wt down_exps;          /* [E, D, down_row] */
     /* Dense branch. */
     float *ffn_norm_shexp;      /* [D] pre_ffw2_norm */
     float *post_ffn_norm_shexp; /* [D] post_ffw2_norm */
-    float *gate_shexp;          /* [H2, D] */
-    float *up_shexp;            /* [H2, D] */
-    float *down_shexp;          /* [D, H2] */
+    g4_wt gate_shexp;          /* [H2, D] */
+    g4_wt up_shexp;            /* [H2, D] */
+    g4_wt down_shexp;          /* [D, H2] */
     /* Combined. */
     float *post_ffn_norm; /* [D] post_ffw_norm */
     float *skip_scale;    /* [1] */
@@ -65,9 +78,12 @@ struct g4_model {
     float softcap, rms_eps;
     float rope_local_base, rope_global_base, rope_global_prop;
     bool k_eq_v_global;
-    float *token_embd;  /* [vocab, D] */
+    g4_wt token_embd;   /* [vocab, D] (also the tied LM head) */
     float *output_norm; /* [D] */
     g4_layer *layer;
+    g4_gguf gguf;       /* kept open for the mmap lifetime when lazy */
+    bool lazy;
+    uint64_t wt_scratch_elems; /* max floats any single deq() must hold */
 };
 
 /* ------------------------------------------------------------------ */
@@ -92,7 +108,8 @@ static bool get_f32(const g4_gguf *g, const char *key, float *out) {
     return true;
 }
 
-/* Loads a tensor and dequantizes it row by row into a fresh f32 buffer. */
+/* Loads a tensor and dequantizes it row by row into a fresh f32 buffer.
+ * Used for small always-resident weights (norms, router, scales). */
 static float *load_f32(const g4_gguf *g, const char *name, uint64_t want_elems,
                        char *err, size_t errlen) {
     const g4_gguf_tensor *t = g4_gguf_tensor_by_name(g, name);
@@ -123,68 +140,136 @@ static float *load_f32(const g4_gguf *g, const char *name, uint64_t want_elems,
     return out;
 }
 
+/* Sets up a large-weight handle.  When lazy, points into the mmap; otherwise
+ * dequantizes the whole tensor to f32 up front.  `want_rows` is validated if
+ * nonzero; ncols is taken from the tensor's contraction dim (dims[0]). */
+static int load_wt(g4_model *m, g4_wt *w, const char *name, uint64_t want_rows,
+                   char *err, size_t errlen) {
+    g4_gguf *g = &m->gguf;
+    const g4_gguf_tensor *t = g4_gguf_tensor_by_name(g, name);
+    if (!t) { seterr(err, errlen, "missing tensor %s", name); return -1; }
+    if (!g4q_can_dequantize((g4q_type)t->type)) {
+        seterr(err, errlen, "cannot dequantize tensor %s", name);
+        return -1;
+    }
+    uint64_t rows = 1;
+    for (uint32_t i = 1; i < t->n_dims; i++) rows *= t->dims[i];
+    if (want_rows && rows != want_rows) {
+        seterr(err, errlen, "tensor %s has unexpected shape", name);
+        return -1;
+    }
+    w->type = t->type;
+    w->nrows = rows;
+    w->ncols = (uint32_t)t->dims[0];
+    w->row_bytes = g4q_row_size((g4q_type)t->type, (int64_t)t->dims[0]);
+    w->f = NULL;
+    w->q = NULL;
+    if (m->lazy) {
+        w->q = g4_gguf_tensor_ptr(g, t);
+        if (!w->q) { seterr(err, errlen, "tensor %s not mapped", name); return -1; }
+    } else {
+        uint8_t *raw = malloc((size_t)t->nbytes);
+        w->f = malloc(sizeof(float) * (size_t)rows * w->ncols);
+        if (!raw || !w->f || g4_gguf_read_tensor_data(g, t, raw)) {
+            free(raw);
+            seterr(err, errlen, "cannot read tensor %s", name);
+            return -1;
+        }
+        for (uint64_t r = 0; r < rows; r++)
+            g4q_dequant_row((g4q_type)t->type, raw + r * w->row_bytes,
+                            w->f + r * w->ncols, w->ncols);
+        free(raw);
+    }
+    return 0;
+}
+
+static void free_wt(g4_wt *w) { free(w->f); w->f = NULL; }
+
+/* Dequantizes rows [row0, row0+nr) into `scratch` (or returns the preloaded
+ * f32 slice directly in RAM mode). */
+static const float *deq_range(const g4_wt *w, uint64_t row0, uint64_t nr,
+                              float *scratch) {
+    if (w->f) return w->f + row0 * w->ncols;
+    const uint8_t *base = w->q + (size_t)row0 * w->row_bytes;
+    for (uint64_t r = 0; r < nr; r++)
+        g4q_dequant_row((g4q_type)w->type, base + r * w->row_bytes,
+                        scratch + r * w->ncols, (int64_t)w->ncols);
+    return scratch;
+}
+
+static const float *deq(const g4_wt *w, float *scratch) {
+    return deq_range(w, 0, w->nrows, scratch);
+}
+
 void g4_model_free(g4_model *m) {
     if (!m) return;
-    free(m->token_embd);
+    free_wt(&m->token_embd);
     free(m->output_norm);
     if (m->layer) {
         for (uint32_t i = 0; i < m->n_layer; i++) {
             g4_layer *l = &m->layer[i];
             free(l->attn_norm); free(l->post_attn_norm);
-            free(l->wq); free(l->wk); free(l->wv); free(l->wo);
+            free_wt(&l->wq); free_wt(&l->wk); free_wt(&l->wv); free_wt(&l->wo);
             free(l->q_norm); free(l->k_norm);
             free(l->ffn_norm); free(l->post_ffn_norm_moe);
             free(l->router); free(l->router_scale); free(l->per_expert_scale);
-            free(l->gate_exps); free(l->up_exps); free(l->down_exps);
+            free_wt(&l->gate_exps); free_wt(&l->up_exps); free_wt(&l->down_exps);
             free(l->ffn_norm_shexp); free(l->post_ffn_norm_shexp);
-            free(l->gate_shexp); free(l->up_shexp); free(l->down_shexp);
+            free_wt(&l->gate_shexp); free_wt(&l->up_shexp); free_wt(&l->down_shexp);
             free(l->post_ffn_norm); free(l->skip_scale);
         }
         free(m->layer);
     }
+    /* Closes the mmap/file kept open for lazy weights (also fine in RAM
+     * mode, where gguf was already closed and zeroed). */
+    if (m->gguf.map_base || m->gguf.fp) g4_gguf_close(&m->gguf);
     free(m);
 }
 
-g4_model *g4_model_load(const char *path, char *err, size_t errlen) {
-    g4_gguf g;
-    if (g4_gguf_open(&g, path, err, errlen)) return NULL;
-
+static g4_model *model_load_impl(const char *path, bool lazy,
+                                 char *err, size_t errlen) {
     g4_model *m = calloc(1, sizeof(*m));
-    bool ok = get_u32(&g, "gemma4.block_count", &m->n_layer) &&
-              get_u32(&g, "gemma4.embedding_length", &m->d_model) &&
-              get_u32(&g, "gemma4.vocab_size", &m->vocab) &&
-              get_u32(&g, "gemma4.context_length", &m->ctx_len) &&
-              get_u32(&g, "gemma4.attention.head_count", &m->n_heads) &&
-              get_u32(&g, "gemma4.attention.head_count_kv", &m->n_kv_local) &&
-              get_u32(&g, "gemma4.attention.global_head_count_kv", &m->n_kv_global) &&
-              get_u32(&g, "gemma4.attention.key_length", &m->key_local) &&
-              get_u32(&g, "gemma4.attention.global_key_length", &m->key_global) &&
-              get_u32(&g, "gemma4.attention.sliding_window", &m->sliding_window) &&
-              get_u32(&g, "gemma4.attention.pattern_period", &m->pattern_period) &&
-              get_f32(&g, "gemma4.attention.layer_norm_rms_epsilon", &m->rms_eps) &&
-              get_f32(&g, "gemma4.rope.local.freq_base", &m->rope_local_base) &&
-              get_f32(&g, "gemma4.rope.global.freq_base", &m->rope_global_base) &&
-              get_f32(&g, "gemma4.rope.global.partial_factor", &m->rope_global_prop) &&
-              get_u32(&g, "gemma4.expert_count", &m->n_experts) &&
-              get_u32(&g, "gemma4.expert_used_count", &m->top_k) &&
-              get_u32(&g, "gemma4.expert_ffn_length", &m->expert_dim) &&
-              get_u32(&g, "gemma4.dense_ffn_length", &m->dense_ffn) &&
-              get_f32(&g, "gemma4.final_logit_softcap", &m->softcap);
-    const g4_gguf_kv *kv = g4_gguf_get(&g, "gemma4.attention.k_eq_v_global");
+    m->lazy = lazy;
+    int rc = lazy ? g4_gguf_open_mmap(&m->gguf, path, err, errlen)
+                  : g4_gguf_open(&m->gguf, path, err, errlen);
+    if (rc) { free(m); return NULL; }
+    g4_gguf *g = &m->gguf;
+
+    bool ok = get_u32(g, "gemma4.block_count", &m->n_layer) &&
+              get_u32(g, "gemma4.embedding_length", &m->d_model) &&
+              get_u32(g, "gemma4.vocab_size", &m->vocab) &&
+              get_u32(g, "gemma4.context_length", &m->ctx_len) &&
+              get_u32(g, "gemma4.attention.head_count", &m->n_heads) &&
+              get_u32(g, "gemma4.attention.head_count_kv", &m->n_kv_local) &&
+              get_u32(g, "gemma4.attention.global_head_count_kv", &m->n_kv_global) &&
+              get_u32(g, "gemma4.attention.key_length", &m->key_local) &&
+              get_u32(g, "gemma4.attention.global_key_length", &m->key_global) &&
+              get_u32(g, "gemma4.attention.sliding_window", &m->sliding_window) &&
+              get_u32(g, "gemma4.attention.pattern_period", &m->pattern_period) &&
+              get_f32(g, "gemma4.attention.layer_norm_rms_epsilon", &m->rms_eps) &&
+              get_f32(g, "gemma4.rope.local.freq_base", &m->rope_local_base) &&
+              get_f32(g, "gemma4.rope.global.freq_base", &m->rope_global_base) &&
+              get_f32(g, "gemma4.rope.global.partial_factor", &m->rope_global_prop) &&
+              get_u32(g, "gemma4.expert_count", &m->n_experts) &&
+              get_u32(g, "gemma4.expert_used_count", &m->top_k) &&
+              get_u32(g, "gemma4.expert_ffn_length", &m->expert_dim) &&
+              get_u32(g, "gemma4.dense_ffn_length", &m->dense_ffn) &&
+              get_f32(g, "gemma4.final_logit_softcap", &m->softcap);
+    const g4_gguf_kv *kv = g4_gguf_get(g, "gemma4.attention.k_eq_v_global");
     m->k_eq_v_global = kv ? kv->v.b : false;
     if (!ok) {
         seterr(err, errlen, "missing gemma4.* metadata%s", "");
-        g4_gguf_close(&g);
         g4_model_free(m);
         return NULL;
     }
 
     const uint32_t D = m->d_model;
-    m->token_embd = load_f32(&g, "token_embd.weight",
-                             (uint64_t)m->vocab * D, err, errlen);
-    m->output_norm = load_f32(&g, "output_norm.weight", D, err, errlen);
+    if (load_wt(m, &m->token_embd, "token_embd.weight", m->vocab, err, errlen))
+        goto fail;
+    m->output_norm = load_f32(g, "output_norm.weight", D, err, errlen);
     m->layer = calloc(m->n_layer, sizeof(g4_layer));
-    if (!m->token_embd || !m->output_norm) goto fail;
+    if (!m->output_norm) goto fail;
+    m->wt_scratch_elems = 0;
 
     for (uint32_t i = 0; i < m->n_layer; i++) {
         g4_layer *l = &m->layer[i];
@@ -192,58 +277,83 @@ g4_model *g4_model_load(const char *path, char *err, size_t errlen) {
         const uint32_t K = l->is_global ? m->key_global : m->key_local;
         const uint32_t KV = l->is_global ? m->n_kv_global : m->n_kv_local;
         char name[128];
-#define LOAD(field, suffix, elems) \
+#define LOADF(field, suffix, elems) \
         do { \
             snprintf(name, sizeof(name), "blk.%u." suffix, i); \
-            l->field = load_f32(&g, name, (elems), err, errlen); \
+            l->field = load_f32(g, name, (elems), err, errlen); \
             if (!l->field) goto fail; \
         } while (0)
-        LOAD(attn_norm, "attn_norm.weight", D);
-        LOAD(post_attn_norm, "post_attn_norm.weight", D);
-        LOAD(wq, "attn_q.weight", (uint64_t)m->n_heads * K * D);
-        LOAD(wk, "attn_k.weight", (uint64_t)KV * K * D);
+        /* LOADW sizes the deq scratch for a whole-matrix dequant; expert
+         * tensors use LOADWE because they are dequantized one expert at a
+         * time (their per-expert size is added explicitly below). */
+#define LOADW(field, suffix, rows) \
+        do { \
+            snprintf(name, sizeof(name), "blk.%u." suffix, i); \
+            if (load_wt(m, &l->field, name, (rows), err, errlen)) goto fail; \
+            uint64_t _e = l->field.nrows * l->field.ncols; \
+            if (_e > m->wt_scratch_elems) m->wt_scratch_elems = _e; \
+        } while (0)
+#define LOADWE(field, suffix, rows) \
+        do { \
+            snprintf(name, sizeof(name), "blk.%u." suffix, i); \
+            if (load_wt(m, &l->field, name, (rows), err, errlen)) goto fail; \
+        } while (0)
+        LOADF(attn_norm, "attn_norm.weight", D);
+        LOADF(post_attn_norm, "post_attn_norm.weight", D);
+        LOADW(wq, "attn_q.weight", (uint64_t)m->n_heads * K);
+        LOADW(wk, "attn_k.weight", (uint64_t)KV * K);
         if (!l->is_global || !m->k_eq_v_global)
-            LOAD(wv, "attn_v.weight", (uint64_t)KV * K * D);
-        LOAD(wo, "attn_output.weight", (uint64_t)D * m->n_heads * K);
-        LOAD(q_norm, "attn_q_norm.weight", K);
-        LOAD(k_norm, "attn_k_norm.weight", K);
-        LOAD(ffn_norm, "ffn_norm.weight", D);
-        LOAD(post_ffn_norm_moe, "post_ffn_norm_moe.weight", D);
-        LOAD(router, "ffn_gate_inp.weight", (uint64_t)m->n_experts * D);
-        LOAD(router_scale, "router_scale", D);
-        LOAD(per_expert_scale, "per_expert_scale", m->n_experts);
-        LOAD(gate_exps, "ffn_gate_exps.weight",
-             (uint64_t)m->n_experts * m->expert_dim * D);
-        LOAD(up_exps, "ffn_up_exps.weight",
-             (uint64_t)m->n_experts * m->expert_dim * D);
-        {
-            snprintf(name, sizeof(name), "blk.%u.ffn_down_exps.weight", i);
-            const g4_gguf_tensor *td = g4_gguf_tensor_by_name(&g, name);
-            if (!td || td->dims[0] < m->expert_dim) {
-                seterr(err, errlen, "bad down_exps tensor %s", name);
-                goto fail;
-            }
-            l->down_row = (uint32_t)td->dims[0];
-        }
-        LOAD(down_exps, "ffn_down_exps.weight",
-             (uint64_t)m->n_experts * D * l->down_row);
-        LOAD(ffn_norm_shexp, "ffn_norm_shexp.weight", D);
-        LOAD(post_ffn_norm_shexp, "post_ffn_norm_shexp.weight", D);
-        LOAD(gate_shexp, "ffn_gate_shexp.weight", (uint64_t)m->dense_ffn * D);
-        LOAD(up_shexp, "ffn_up_shexp.weight", (uint64_t)m->dense_ffn * D);
-        LOAD(down_shexp, "ffn_down_shexp.weight", (uint64_t)D * m->dense_ffn);
-        LOAD(post_ffn_norm, "post_ffn_norm.weight", D);
-        LOAD(skip_scale, "skip_scale", 1);
-#undef LOAD
+            LOADW(wv, "attn_v.weight", (uint64_t)KV * K);
+        LOADW(wo, "attn_output.weight", D);
+        LOADF(q_norm, "attn_q_norm.weight", K);
+        LOADF(k_norm, "attn_k_norm.weight", K);
+        LOADF(ffn_norm, "ffn_norm.weight", D);
+        LOADF(post_ffn_norm_moe, "post_ffn_norm_moe.weight", D);
+        LOADF(router, "ffn_gate_inp.weight", (uint64_t)m->n_experts * D);
+        LOADF(router_scale, "router_scale", D);
+        LOADF(per_expert_scale, "per_expert_scale", m->n_experts);
+        LOADWE(gate_exps, "ffn_gate_exps.weight",
+               (uint64_t)m->n_experts * m->expert_dim);
+        LOADWE(up_exps, "ffn_up_exps.weight",
+               (uint64_t)m->n_experts * m->expert_dim);
+        LOADWE(down_exps, "ffn_down_exps.weight", (uint64_t)m->n_experts * D);
+        l->down_row = l->down_exps.ncols;
+        LOADF(ffn_norm_shexp, "ffn_norm_shexp.weight", D);
+        LOADF(post_ffn_norm_shexp, "post_ffn_norm_shexp.weight", D);
+        LOADW(gate_shexp, "ffn_gate_shexp.weight", m->dense_ffn);
+        LOADW(up_shexp, "ffn_up_shexp.weight", m->dense_ffn);
+        LOADW(down_shexp, "ffn_down_shexp.weight", D);
+        LOADF(post_ffn_norm, "post_ffn_norm.weight", D);
+        LOADF(skip_scale, "skip_scale", 1);
+#undef LOADF
+#undef LOADW
+#undef LOADWE
+        /* Per-expert deq handles only one expert's rows at a time. */
+        uint64_t ge = (l->gate_exps.nrows / m->n_experts) * l->gate_exps.ncols;
+        uint64_t de = (l->down_exps.nrows / m->n_experts) * l->down_exps.ncols;
+        if (ge > m->wt_scratch_elems) m->wt_scratch_elems = ge;
+        if (de > m->wt_scratch_elems) m->wt_scratch_elems = de;
     }
 
-    g4_gguf_close(&g);
+    /* token_embd is dequantized one row at a time for the embed step. */
+    if (m->token_embd.ncols > m->wt_scratch_elems)
+        m->wt_scratch_elems = m->token_embd.ncols;
+
+    /* In RAM mode nothing more references the file. */
+    if (!lazy) g4_gguf_close(&m->gguf);
     return m;
 
 fail:
-    g4_gguf_close(&g);
     g4_model_free(m);
     return NULL;
+}
+
+g4_model *g4_model_load(const char *path, char *err, size_t errlen) {
+    return model_load_impl(path, false, err, errlen);
+}
+
+g4_model *g4_model_load_mmap(const char *path, char *err, size_t errlen) {
+    return model_load_impl(path, true, err, errlen);
 }
 
 uint32_t g4_model_vocab(const g4_model *m) { return m->vocab; }
@@ -324,7 +434,15 @@ struct g4_session {
     /* Scratch. */
     float *x, *xn, *tmp, *res, *q, *kraw, *att, *enc;
     float *gate, *up, *ffn, *moe_out, *dense_out, *rlogits;
+    /* Weight-dequant scratch for frugal (mmap) mode: one big buffer for a
+     * whole matrix / one expert, plus a bounded chunk buffer for the tied
+     * decode over the vocab.  Unused (but tiny) in RAM mode. */
+    float *wscratch;
+    float *embd_chunk;
+    uint32_t embd_chunk_rows;
 };
+
+#define G4_EMBD_CHUNK_ROWS 8192u
 
 static uint32_t layer_cache_rows(const g4_model *m, uint32_t li, uint32_t ctx) {
     return m->layer[li].is_global
@@ -371,6 +489,11 @@ g4_session *g4_session_create(const g4_model *m, uint32_t ctx) {
     s->moe_out = malloc(sizeof(float) * D);
     s->dense_out = malloc(sizeof(float) * D);
     s->rlogits = malloc(sizeof(float) * m->n_experts);
+    if (m->lazy) {
+        s->wscratch = malloc(sizeof(float) * (size_t)m->wt_scratch_elems);
+        s->embd_chunk_rows = G4_EMBD_CHUNK_ROWS;
+        s->embd_chunk = malloc(sizeof(float) * (size_t)s->embd_chunk_rows * D);
+    }
     return s;
 }
 
@@ -385,6 +508,7 @@ void g4_session_free(g4_session *s) {
     free(s->x); free(s->xn); free(s->tmp); free(s->res); free(s->q);
     free(s->kraw); free(s->att); free(s->enc); free(s->gate); free(s->up);
     free(s->ffn); free(s->moe_out); free(s->dense_out); free(s->rlogits);
+    free(s->wscratch); free(s->embd_chunk);
     free(s);
 }
 
@@ -403,7 +527,7 @@ int g4_session_eval(g4_session *s, int32_t token) {
     float *x = s->x, *xn = s->xn, *tmp = s->tmp, *res = s->res;
 
     /* Embedder.encode: table row * sqrt(D)  (_modules.py:112-125) */
-    const float *row = m->token_embd + (size_t)token * D;
+    const float *row = deq_range(&m->token_embd, (uint64_t)token, 1, s->wscratch);
     const float emb_scale = sqrtf((float)D);
     for (uint32_t d = 0; d < D; d++) x[d] = row[d] * emb_scale;
 
@@ -420,14 +544,14 @@ int g4_session_eval(g4_session *s, int32_t token) {
         /* 1. Attention (_modules.py:619-634). */
         rms_norm(x, l->attn_norm, xn, D, m->rms_eps);
 
-        matvec(l->wq, xn, s->q, H * K, D);
+        matvec(deq(&l->wq, s->wscratch), xn, s->q, H * K, D);
         for (uint32_t h = 0; h < H; h++) {
             rms_norm(s->q + h * K, l->q_norm, s->q + h * K, K, m->rms_eps);
             apply_rope(s->q + h * K, K, pos, base, prop);
         }
 
         const uint32_t slot = l->is_global ? pos : pos % rows;
-        matvec(l->wk, xn, s->kraw, KV * K, D);
+        matvec(deq(&l->wk, s->wscratch), xn, s->kraw, KV * K, D);
         float *kdst = s->ck[li] + (size_t)slot * KV * K;
         float *vdst = s->cv[li] + (size_t)slot * KV * K;
         for (uint32_t h = 0; h < KV; h++) {
@@ -444,7 +568,7 @@ int g4_session_eval(g4_session *s, int32_t token) {
             }
         }
         if (!(l->is_global && m->k_eq_v_global)) {
-            matvec(l->wv, xn, s->kraw, KV * K, D);
+            matvec(deq(&l->wv, s->wscratch), xn, s->kraw, KV * K, D);
             for (uint32_t h = 0; h < KV; h++)
                 rms_norm(s->kraw + h * K, NULL, vdst + h * K, K, m->rms_eps);
         }
@@ -477,17 +601,17 @@ int g4_session_eval(g4_session *s, int32_t token) {
                 for (uint32_t d = 0; d < K; d++) eh[d] += p * vv[d];
             }
         }
-        matvec(l->wo, s->enc, tmp, D, H * K);
+        matvec(deq(&l->wo, s->wscratch), s->enc, tmp, D, H * K);
         rms_norm(tmp, l->post_attn_norm, tmp, D, m->rms_eps);
         for (uint32_t d = 0; d < D; d++) res[d] = x[d] + tmp[d];
 
         /* 2. FFN: dense branch (_modules.py:674-680). */
         rms_norm(res, l->ffn_norm_shexp, xn, D, m->rms_eps);
-        matvec(l->gate_shexp, xn, s->gate, H2, D);
-        matvec(l->up_shexp, xn, s->up, H2, D);
+        matvec(deq(&l->gate_shexp, s->wscratch), xn, s->gate, H2, D);
+        matvec(deq(&l->up_shexp, s->wscratch), xn, s->up, H2, D);
         for (uint32_t hh = 0; hh < H2; hh++)
             s->gate[hh] = gelu_tanh(s->gate[hh]) * s->up[hh];
-        matvec(l->down_shexp, s->gate, s->dense_out, D, H2);
+        matvec(deq(&l->down_shexp, s->wscratch), s->gate, s->dense_out, D, H2);
         rms_norm(s->dense_out, l->post_ffn_norm_shexp, s->dense_out, D,
                  m->rms_eps);
 
@@ -523,11 +647,16 @@ int g4_session_eval(g4_session *s, int32_t token) {
             const uint32_t e = sel[j];
             const float w = s->rlogits[e] / wsum;
             const float pes = l->per_expert_scale[e];
-            matvec(l->gate_exps + (size_t)e * Hexp * D, xn, s->gate, Hexp, D);
-            matvec(l->up_exps + (size_t)e * Hexp * D, xn, s->up, Hexp, D);
+            const float *ge = deq_range(&l->gate_exps, (uint64_t)e * Hexp,
+                                        Hexp, s->wscratch);
+            matvec(ge, xn, s->gate, Hexp, D);
+            const float *ue = deq_range(&l->up_exps, (uint64_t)e * Hexp,
+                                        Hexp, s->wscratch);
+            matvec(ue, xn, s->up, Hexp, D);
             for (uint32_t hh = 0; hh < Hexp; hh++)
                 s->gate[hh] = gelu_tanh(s->gate[hh]) * s->up[hh];
-            const float *wd = l->down_exps + (size_t)e * D * l->down_row;
+            const float *wd = deq_range(&l->down_exps, (uint64_t)e * D, D,
+                                        s->wscratch);
             for (uint32_t d = 0; d < D; d++)
                 s->ffn[d] = dot(wd + (size_t)d * l->down_row, s->gate, Hexp);
             for (uint32_t d = 0; d < D; d++)
@@ -543,9 +672,20 @@ int g4_session_eval(g4_session *s, int32_t token) {
             x[d] = (res[d] + s->ffn[d]) * l->skip_scale[0];
     }
 
-    /* Final norm + tied decode + softcap (_transformer.py:332-336). */
+    /* Final norm + tied decode + softcap (_transformer.py:332-336).  In
+     * frugal mode the vocab-sized embedding matrix is dequantized in bounded
+     * row-chunks so the LM head never materializes in full. */
     rms_norm(x, m->output_norm, xn, D, m->rms_eps);
-    matvec(m->token_embd, xn, s->logits, m->vocab, D);
+    if (m->token_embd.f) {
+        matvec(m->token_embd.f, xn, s->logits, m->vocab, D);
+    } else {
+        for (uint32_t v0 = 0; v0 < m->vocab; v0 += s->embd_chunk_rows) {
+            uint32_t nr = m->vocab - v0;
+            if (nr > s->embd_chunk_rows) nr = s->embd_chunk_rows;
+            const float *rows = deq_range(&m->token_embd, v0, nr, s->embd_chunk);
+            matvec(rows, xn, s->logits + v0, nr, D);
+        }
+    }
     for (uint32_t v = 0; v < m->vocab; v++)
         s->logits[v] = tanhf(s->logits[v] / m->softcap) * m->softcap;
 

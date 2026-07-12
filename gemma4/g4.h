@@ -18,6 +18,10 @@ typedef struct g4_model g4_model;
 typedef struct g4_session g4_session;
 
 g4_model *g4_model_load(const char *path, char *err, size_t errlen);
+/* Frugal loader: mmaps the GGUF and keeps weights quantized, dequantizing on
+ * demand during inference.  Peak RAM stays well under 1 GiB, so a model far
+ * larger than RAM runs (slower, streaming from the SSD). */
+g4_model *g4_model_load_mmap(const char *path, char *err, size_t errlen);
 void g4_model_free(g4_model *m);
 
 uint32_t g4_model_vocab(const g4_model *m);

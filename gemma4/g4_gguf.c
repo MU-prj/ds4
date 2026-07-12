@@ -1,8 +1,12 @@
+#define _GNU_SOURCE /* fileno, madvise, MADV_RANDOM */
+
 #include "g4_gguf.h"
 
 #include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 static void g4_gguf_seterr(char *err, size_t errlen, const char *msg) {
     if (err && errlen) snprintf(err, errlen, "%s", msg);
@@ -211,7 +215,34 @@ int g4_gguf_open(g4_gguf *g, const char *path, char *err, size_t errlen) {
     return 0;
 }
 
+int g4_gguf_open_mmap(g4_gguf *g, const char *path, char *err, size_t errlen) {
+    if (g4_gguf_open(g, path, err, errlen)) return -1;
+    if (fseek(g->fp, 0, SEEK_END)) { g4_gguf_close(g); return -1; }
+    long sz = ftell(g->fp);
+    if (sz <= 0) { g4_gguf_seterr(err, errlen, "empty file"); g4_gguf_close(g); return -1; }
+    int fd = fileno(g->fp);
+    void *base = mmap(NULL, (size_t)sz, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (base == MAP_FAILED) {
+        g4_gguf_seterr(err, errlen, "mmap failed");
+        g4_gguf_close(g);
+        return -1;
+    }
+    /* Sequential-ish streaming access; advise the kernel accordingly. */
+    madvise(base, (size_t)sz, MADV_RANDOM);
+    g->map_base = base;
+    g->map_size = (uint64_t)sz;
+    return 0;
+}
+
+const void *g4_gguf_tensor_ptr(const g4_gguf *g, const g4_gguf_tensor *t) {
+    if (!g->map_base) return NULL;
+    uint64_t off = g->data_offset + t->offset;
+    if (off + t->nbytes > g->map_size) return NULL;
+    return (const uint8_t *)g->map_base + off;
+}
+
 void g4_gguf_close(g4_gguf *g) {
+    if (g->map_base) munmap(g->map_base, (size_t)g->map_size);
     if (g->fp) fclose(g->fp);
     for (uint64_t i = 0; i < g->n_kv; i++) {
         g4_gguf_kv *kv = &g->kv[i];

@@ -58,14 +58,24 @@ typedef struct {
     uint64_t n_kv;
     g4_gguf_tensor *tensor;
     uint64_t n_tensor;
+    /* Optional read-only mmap of the whole file, for zero-copy tensor
+     * access on machines that cannot hold the model in RAM. */
+    void *map_base;
+    uint64_t map_size;
 } g4_gguf;
 
 int g4_gguf_open(g4_gguf *g, const char *path, char *err, size_t errlen);
+/* Like g4_gguf_open, but also mmaps the file read-only so tensor bytes can
+ * be reached with g4_gguf_tensor_ptr() without copying into RAM. */
+int g4_gguf_open_mmap(g4_gguf *g, const char *path, char *err, size_t errlen);
 void g4_gguf_close(g4_gguf *g);
 const g4_gguf_kv *g4_gguf_get(const g4_gguf *g, const char *key);
 const g4_gguf_tensor *g4_gguf_tensor_by_name(const g4_gguf *g, const char *name);
 /* dst must hold t->nbytes bytes. */
 int g4_gguf_read_tensor_data(const g4_gguf *g, const g4_gguf_tensor *t, void *dst);
+/* Zero-copy pointer to a tensor's bytes inside the mmap; NULL if the file was
+ * not opened with g4_gguf_open_mmap(). */
+const void *g4_gguf_tensor_ptr(const g4_gguf *g, const g4_gguf_tensor *t);
 
 /* Writer: buffers metadata and tensor descriptors, streams tensor bytes to a
  * temp layout on finish.  Tensor data pointers must stay valid until

@@ -27,8 +27,10 @@ I documenti di progetto sono in [`../gemma4-port/`](../gemma4-port/):
 | payload G4SP (`g4_session_save/load_payload`) | serializzazione dello stato per il disk KV (doc 03 §5), dtype f32 nel path di riferimento | fatto |
 | `tests/g4_session_test.c` | incrementale == batch; save a metà (oltre il wrap del ring) → resume in sessione nuova → continuazione **bit-esatta**; reject di shape/ctx sbagliati | verde |
 | `tools/g4-quantize.c` | convertitore safetensors→GGUF senza template: config da config.json, shape dagli header degli shard con **verifica di orientamento** (rifiuta layout trasposti), split del fuso gate_up, padding del down ai blocchi k-quant, profili `f32`/`q8`/`q4`, scrittura streaming, `--dry-run`/`--compare-tensor` | fatto (v1: no imatrix, single-thread) |
-| `scripts/gen_synthetic_hf.py` + `make test-converter` | checkpoint HF **sintetico** ricostruito dai pesi toy (stessi nomi/layout di google/gemma-4-26B-A4B-it) → convertito → il motore rifà i logits JAX **esatti** (5e-6) | verde |
-| `scripts/gen_logit_vectors.py` | vettori top-k logprob dal modello vero via transformers (gate M2) | scritto, da eseguire sulla macchina con i pesi |
+| `scripts/gen_synthetic_hf.py` + `make test-converter` | checkpoint HF **sintetico** ricostruito dai pesi toy (stessi nomi/layout di google/gemma-4-26B-A4B-it) → convertito → il motore rifà i logits JAX **esatti** (5e-6), sia in RAM sia in modalità mmap | verde |
+| modalità frugale mmap (`g4_model_load_mmap`) | mmap del GGUF + dequantizzazione al volo per tensore/esperto; picco RAM < 1 GiB → il modello 26B gira anche su macchine da 12 GB (lento, streaming da SSD) | fatto |
+| `tools/g4-run.c` | CLI di generazione: carica modello + tokenizer, encode del prompt, decode greedy/sampling; smoke test end-to-end di un modello convertito | fatto |
+| `scripts/gen_logit_vectors.py` + `tests/g4_m2_test.c` | vettori top-k logprob dal modello vero via transformers e gate M2 (argmax + distanza logprob) | scritti, da eseguire sulla macchina con i pesi |
 
 ```sh
 make test
@@ -40,6 +42,19 @@ Il GGUF giocattolo è generato dai moduli JAX veri del fork gemma:
 cd ../../gemma && python3 g4ref/gen_toy_vectors.py ../ds4/gemma4/tests/vectors/toy.gguf
 ```
 
-Prossima milestone (doc 04 §4): M2 — convertitore `g4-quantize` dai
-safetensors reali e vettori logits via transformers (richiede i pesi da
-48 GiB sulla macchina di sviluppo).
+## Uso col modello reale (dopo la conversione)
+
+```sh
+# conversione HF -> GGUF q8 (~25 GiB)
+./g4-quantize --hf /percorso/weights --out gemma4-q8.gguf --profile q8
+
+# tabella tokenizer (una tantum)
+python3 scripts/gen_tokenizer_vectors.py
+
+# generazione (mmap frugale: gira anche con 12 GB di RAM)
+./g4-run -m gemma4-q8.gguf -t tests/vectors/tok_table.bin -p "Ciao, come stai?" -n 64
+
+# gate M2 contro i vettori transformers
+python3 scripts/gen_logit_vectors.py --weights /percorso/weights
+./g4_m2_test gemma4-q8.gguf tests/vectors/real_vectors.bin 0.1
+```

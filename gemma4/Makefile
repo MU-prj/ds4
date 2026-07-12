@@ -4,7 +4,7 @@ LDLIBS = -lm -lpthread
 
 OBJS = g4_quants.o g4_dequant.o g4_gguf.o g4_kvstore.o g4_tokenizer.o g4.o
 
-all: g4_test g4_toy_test g4_tok_test g4_session_test g4-quantize
+all: g4_test g4_toy_test g4_tok_test g4_session_test g4-quantize g4-run g4_m2_test
 
 %.o: %.c g4.h g4_quants.h g4_gguf.h g4_kvstore.h g4_tokenizer.h
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -21,8 +21,14 @@ g4_tok_test: tests/g4_tok_test.c $(OBJS)
 g4_session_test: tests/g4_session_test.c $(OBJS)
 	$(CC) $(CFLAGS) -o $@ tests/g4_session_test.c $(OBJS) $(LDLIBS)
 
+g4_m2_test: tests/g4_m2_test.c $(OBJS)
+	$(CC) $(CFLAGS) -o $@ tests/g4_m2_test.c $(OBJS) $(LDLIBS)
+
 g4-quantize: tools/g4-quantize.c $(OBJS)
 	$(CC) $(CFLAGS) -o $@ tools/g4-quantize.c $(OBJS) $(LDLIBS)
+
+g4-run: tools/g4-run.c $(OBJS)
+	$(CC) $(CFLAGS) -o $@ tools/g4-run.c $(OBJS) $(LDLIBS)
 
 test: g4_test g4_toy_test g4_tok_test g4_session_test
 	./g4_test
@@ -31,14 +37,21 @@ test: g4_test g4_toy_test g4_tok_test g4_session_test
 	@if [ -f tests/vectors/tok_table.bin ]; then ./g4_tok_test; else echo "tok_table.bin missing (scripts/gen_tokenizer_vectors.py), skipping tokenizer test"; fi
 
 # End-to-end converter check: rebuild a synthetic HF checkpoint from the toy
-# weights, convert it back, and require the exact JAX logits again.
+# weights, convert it back, and require the exact JAX logits again.  Runs in
+# both RAM and frugal (mmap) mode so both weight paths are exercised.
 # Needs python3 + numpy.
 test-converter: g4-quantize g4_toy_test
 	python3 scripts/gen_synthetic_hf.py /tmp/g4-synth-f32 --f32
 	./g4-quantize --hf /tmp/g4-synth-f32 --out /tmp/g4-synth-f32.gguf --profile f32
-	./g4_toy_test /tmp/g4-synth-f32.gguf tests/vectors/toy.gguf
+	./g4_toy_test /tmp/g4-synth-f32.gguf tests/vectors/toy.gguf 5e-3
+	@echo "-- same model, frugal mmap path --"
+	./g4_toy_test /tmp/g4-synth-f32.gguf tests/vectors/toy.gguf 5e-3 mmap
+	@echo "-- q8 conversion, frugal mmap path (smoke: finite output) --"
+	python3 scripts/gen_synthetic_hf.py /tmp/g4-synth-hf
+	./g4-quantize --hf /tmp/g4-synth-hf --out /tmp/g4-synth-q8.gguf --profile q8
+	./g4_toy_test /tmp/g4-synth-q8.gguf tests/vectors/toy.gguf 2.0 mmap
 
 clean:
-	rm -f g4_test g4_toy_test g4_tok_test g4_session_test g4-quantize *.o
+	rm -f g4_test g4_toy_test g4_tok_test g4_session_test g4_m2_test g4-quantize g4-run *.o
 
 .PHONY: all test test-converter clean
