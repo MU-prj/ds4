@@ -600,20 +600,22 @@ int main(int argc, char **argv) {
             if (p->tr == TR_GATE || p->tr == TR_UP) {
                 bool want_gate = (p->tr == TR_GATE) != swap_gate_up;
                 uint64_t half = want_gate ? 0 : H;
-                if (t->dims[1] == D) {
-                    /* src [E, D, 2H] -> rows [(e,h)][d] */
-                    for (uint64_t e = 0; e < E; e++)
-                        for (uint64_t hh = 0; hh < H; hh++)
-                            for (uint64_t d2 = 0; d2 < D; d2++)
-                                rowsbuf[(e * H + hh) * D + d2] =
-                                    src[(e * D + d2) * 2 * H + half + hh];
-                } else {
+                /* Prefer the real google layout [E, 2*H, D] when the shape is
+                 * ambiguous (2*H == D): dims[1]==2*H matches it first. */
+                if (t->dims[1] == 2 * H) {
                     /* src [E, 2H, D] -> rows [(e,h)][d] (contiguous copy) */
                     for (uint64_t e = 0; e < E; e++)
                         for (uint64_t hh = 0; hh < H; hh++)
                             memcpy(rowsbuf + (e * H + hh) * D,
                                    src + (e * 2 * H + half + hh) * D,
                                    sizeof(float) * (size_t)D);
+                } else {
+                    /* src [E, D, 2H] -> rows [(e,h)][d] */
+                    for (uint64_t e = 0; e < E; e++)
+                        for (uint64_t hh = 0; hh < H; hh++)
+                            for (uint64_t d2 = 0; d2 < D; d2++)
+                                rowsbuf[(e * H + hh) * D + d2] =
+                                    src[(e * D + d2) * 2 * H + half + hh];
                 }
             } else { /* TR_DOWN -> rows [(e,d)][h(+pad)] */
                 memset(rowsbuf, 0, sizeof(float) * (size_t)rows * ncols);

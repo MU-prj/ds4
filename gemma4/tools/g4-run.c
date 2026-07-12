@@ -60,7 +60,7 @@ int main(int argc, char **argv) {
     const char *model_path = NULL, *tok_path = NULL, *prompt = "Ciao";
     int n_predict = 64, top_k = 40;
     float temp = 0.0f;
-    bool ram = false;
+    bool ram = false, chat = false;
     uint64_t seed = 1234;
 
     for (int i = 1; i < argc; i++) {
@@ -72,6 +72,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--top-k") && i + 1 < argc) top_k = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--seed") && i + 1 < argc) seed = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--ram")) ram = true;
+        else if (!strcmp(argv[i], "--chat")) chat = true;
         else { fprintf(stderr, "unknown arg %s\n", argv[i]); return 1; }
     }
     if (!model_path || !tok_path) {
@@ -93,12 +94,22 @@ int main(int argc, char **argv) {
             (double)clock() / CLOCKS_PER_SEC - t0, g4_model_vocab(m),
             g4_model_layers(m));
 
-    /* BOS (2) + prompt tokens. */
-    int32_t ids[4096];
+    /* BOS (2) + prompt.  --chat wraps the prompt in the Gemma 4 turn format
+     * (<|turn>=105, <turn|>=106), which the instruct model expects; raw text
+     * without it is out-of-distribution and produces degenerate output. */
+    int32_t ids[8192];
     ids[0] = 2;
-    uint32_t n_prompt = 1 + g4_tokenizer_encode(tok, prompt, strlen(prompt),
-                                                ids + 1, 4095);
-    if (n_prompt > 4096) n_prompt = 4096;
+    uint32_t n_prompt;
+    if (chat) {
+        char buf[6000];
+        snprintf(buf, sizeof(buf),
+                 "<|turn>user\n%s<turn|>\n<|turn>model\n", prompt);
+        n_prompt = 1 + g4_tokenizer_encode(tok, buf, strlen(buf), ids + 1, 8191);
+    } else {
+        n_prompt = 1 + g4_tokenizer_encode(tok, prompt, strlen(prompt),
+                                           ids + 1, 8191);
+    }
+    if (n_prompt > 8192) n_prompt = 8192;
 
     uint32_t ctx = n_prompt + (uint32_t)n_predict + 8;
     g4_session *s = g4_session_create(m, ctx);
